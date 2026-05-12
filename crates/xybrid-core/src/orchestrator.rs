@@ -353,11 +353,15 @@ impl Orchestrator {
             stage_name: stage.name.clone(),
             target: routing_decision.target.to_json_string(),
             reason: routing_decision.reason.clone(),
+            recent_abort_rate: routing_decision.local_reliability_hint.recent_abort_rate,
+            sample_size: routing_decision.local_reliability_hint.sample_size,
         });
         self.telemetry.log_routing_decision(
             &stage.name,
             &routing_decision.target.to_json_string(),
             &routing_decision.reason,
+            routing_decision.local_reliability_hint.recent_abort_rate,
+            routing_decision.local_reliability_hint.sample_size,
         );
 
         // Step 4: Execute model based on routing decision
@@ -581,11 +585,15 @@ impl Orchestrator {
             stage_name: stage.name.clone(),
             target: routing_decision.target.to_json_string(),
             reason: routing_decision.reason.clone(),
+            recent_abort_rate: routing_decision.local_reliability_hint.recent_abort_rate,
+            sample_size: routing_decision.local_reliability_hint.sample_size,
         });
         self.telemetry.log_routing_decision(
             &stage.name,
             &routing_decision.target.to_json_string(),
             &routing_decision.reason,
+            routing_decision.local_reliability_hint.recent_abort_rate,
+            routing_decision.local_reliability_hint.sample_size,
         );
 
         // Execute model in blocking thread pool (adapter execution may be CPU-bound)

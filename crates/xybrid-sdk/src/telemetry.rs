@@ -927,6 +927,12 @@ fn convert_to_platform_event(
                 "correlation_id",
                 "outcome_category",
                 "abort_reason",
+                // Per-routing-decision reliability hint (object with
+                // `recent_abort_rate` + `sample_size`). Lives in the SDK
+                // hoist list so the analytics backend can extract it via
+                // `json:$.local_reliability_hint.*` without descending
+                // into the nested data object.
+                "local_reliability_hint",
             ]
             .iter()
             {
@@ -1479,6 +1485,16 @@ pub fn publish_with_resource_summary(
     publish_telemetry_event(event);
 }
 
+pub(crate) fn publish_with_resource_summary_in_context(
+    mut event: TelemetryEvent,
+    guard: xybrid_core::device::RunGuard,
+    pipeline_id: Option<Uuid>,
+    trace_id: Option<Uuid>,
+) {
+    attach_resource_summary(&mut event, guard.finish());
+    publish_telemetry_event_in_context(event, pipeline_id, trace_id);
+}
+
 /// Build a `LocalAborted` telemetry event for a resource-driven cloud-fallback
 /// abort.
 ///
@@ -1942,13 +1958,35 @@ pub fn convert_orchestrator_event(event: &OrchestratorEvent) -> TelemetryEvent {
             stage_name,
             target,
             reason,
+            recent_abort_rate,
+            sample_size,
         } => TelemetryEvent {
             event_type: "RoutingDecided".to_string(),
             stage_name: Some(stage_name.clone()),
             target: Some(target.clone()),
             latency_ms: None,
             error: None,
-            data: Some(serde_json::json!({"reason": reason}).to_string()),
+            // Embed the local reliability hint at the top level of event.data
+            // so the `convert_to_platform_event` hoist list can surface it on
+            // the payload at the top level (where the platform datasource's
+            // JSONPath extractors live, alongside correlation_id / outcome_*).
+            // Non-finite f32 values would serialize to JSON `null`, breaking
+            // the typed platform column; the authority emits only finite
+            // values, but we sanitize at the bridge for defense in depth.
+            data: Some(
+                serde_json::json!({
+                    "reason": reason,
+                    "local_reliability_hint": {
+                        "recent_abort_rate": if recent_abort_rate.is_finite() {
+                            *recent_abort_rate
+                        } else {
+                            0.0_f32
+                        },
+                        "sample_size": sample_size,
+                    },
+                })
+                .to_string(),
+            ),
             timestamp_ms,
         },
         OrchestratorEvent::ExecutionStarted { stage_name, target } => TelemetryEvent {
@@ -2103,6 +2141,14 @@ fn current_telemetry_pipeline_context() -> (Option<Uuid>, Option<Uuid>) {
 
 fn snapshot_context_into_event(event: TelemetryEvent) -> TelemetryEvent {
     let (pipeline_id, trace_id) = current_telemetry_pipeline_context();
+    snapshot_context_into_event_with(event, pipeline_id, trace_id)
+}
+
+fn snapshot_context_into_event_with(
+    event: TelemetryEvent,
+    pipeline_id: Option<Uuid>,
+    trace_id: Option<Uuid>,
+) -> TelemetryEvent {
     if pipeline_id.is_none() && trace_id.is_none() {
         return event;
     }
@@ -2223,7 +2269,20 @@ pub fn publish_telemetry_event(event: TelemetryEvent) {
     // composability) are left untouched so they keep full control.
     let event = snapshot_spans_into_event(event);
     let event = snapshot_context_into_event(event);
+    dispatch_telemetry_event(event);
+}
 
+pub(crate) fn publish_telemetry_event_in_context(
+    event: TelemetryEvent,
+    pipeline_id: Option<Uuid>,
+    trace_id: Option<Uuid>,
+) {
+    let event = snapshot_spans_into_event(event);
+    let event = snapshot_context_into_event_with(event, pipeline_id, trace_id);
+    dispatch_telemetry_event(event);
+}
+
+fn dispatch_telemetry_event(event: TelemetryEvent) {
     // Use unwrap_or_else to recover from poisoned mutex - this prevents
     // a panic in one component from permanently breaking telemetry
     let Ok(senders) = TELEMETRY_SENDERS.lock() else {
@@ -2249,25 +2308,80 @@ pub fn publish_telemetry_event(event: TelemetryEvent) {
     }
 }
 
-/// Bridge orchestrator events to telemetry stream
+/// Scoped bridge from an orchestrator event bus to the telemetry stream.
 ///
-/// This function subscribes to orchestrator events and converts them
-/// to telemetry events, publishing them to all registered subscribers.
-pub fn bridge_orchestrator_events(orchestrator: &xybrid_core::orchestrator::Orchestrator) {
+/// The bridge captures the current pipeline context when it subscribes, then
+/// embeds that context into each converted event before enqueueing it. Callers
+/// that own a short-lived orchestrator should keep this handle and call
+/// [`Self::drain`] before returning so queued orchestrator events are not left
+/// behind a detached worker.
+pub struct OrchestratorEventBridge {
+    subscription: xybrid_core::event_bus::Subscription,
+    pipeline_id: Option<Uuid>,
+    trace_id: Option<Uuid>,
+}
+
+impl OrchestratorEventBridge {
+    /// Publish all events currently buffered for this bridge.
+    pub fn drain(&self) {
+        loop {
+            match self.subscription.try_recv() {
+                Ok(event) => self.publish_event(&event),
+                Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => break,
+            }
+        }
+    }
+
+    fn publish_event(&self, event: &OrchestratorEvent) {
+        let telemetry_event = convert_orchestrator_event(event);
+        publish_telemetry_event_in_context(telemetry_event, self.pipeline_id, self.trace_id);
+    }
+
+    fn recv_forever(self) {
+        while let Ok(event) = self.subscription.recv() {
+            self.publish_event(&event);
+        }
+    }
+}
+
+impl Drop for OrchestratorEventBridge {
+    fn drop(&mut self) {
+        self.drain();
+    }
+}
+
+/// Subscribe to orchestrator events and return a drainable bridge handle.
+pub fn subscribe_orchestrator_events(
+    orchestrator: &xybrid_core::orchestrator::Orchestrator,
+) -> OrchestratorEventBridge {
+    let (pipeline_id, trace_id) = current_telemetry_pipeline_context();
+    subscribe_orchestrator_events_in_context(orchestrator, pipeline_id, trace_id)
+}
+
+pub(crate) fn subscribe_orchestrator_events_in_context(
+    orchestrator: &xybrid_core::orchestrator::Orchestrator,
+    pipeline_id: Option<Uuid>,
+    trace_id: Option<Uuid>,
+) -> OrchestratorEventBridge {
     let event_bus = orchestrator.event_bus();
     let subscription = event_bus.subscribe();
 
-    thread::spawn(move || {
-        loop {
-            match subscription.recv() {
-                Ok(event) => {
-                    let telemetry_event = convert_orchestrator_event(&event);
-                    publish_telemetry_event(telemetry_event);
-                }
-                Err(_) => break, // Event bus closed
-            }
-        }
-    });
+    OrchestratorEventBridge {
+        subscription,
+        pipeline_id,
+        trace_id,
+    }
+}
+
+/// Bridge orchestrator events to telemetry stream on a background thread.
+///
+/// Short-lived SDK entry points should prefer [`subscribe_orchestrator_events`]
+/// and drain the returned handle before returning. This detached helper is kept
+/// for long-running CLI flows that own an orchestrator for an interactive
+/// session.
+pub fn bridge_orchestrator_events(orchestrator: &xybrid_core::orchestrator::Orchestrator) {
+    let bridge = subscribe_orchestrator_events(orchestrator);
+    thread::spawn(move || bridge.recv_forever());
 }
 
 #[cfg(test)]
@@ -2471,6 +2585,85 @@ mod tests {
             "aborted_for_cloud_fallback"
         );
         assert_eq!(platform.payload["abort_reason"], "stress_memory");
+    }
+
+    #[test]
+    fn local_reliability_hint_hoists_to_platform_event_top_level() {
+        // RoutingDecision events serialize the hint into event.data via
+        // `Telemetry::log_routing_decision`. The hoist list in
+        // convert_to_platform_event must copy that nested object to the
+        // payload top level so the analytics backend can column-extract
+        // `json:$.local_reliability_hint.recent_abort_rate` and
+        // `.sample_size` without descending into `data`.
+        let event = TelemetryEvent {
+            event_type: "RoutingDecision".to_string(),
+            stage_name: Some("stage-1".to_string()),
+            target: Some("cloud".to_string()),
+            latency_ms: None,
+            error: None,
+            data: Some(
+                serde_json::json!({
+                    "stage": "stage-1",
+                    "target": "cloud",
+                    "reason": "history_bias",
+                    "local_reliability_hint": {
+                        "recent_abort_rate": 0.75,
+                        "sample_size": 4_u32,
+                    }
+                })
+                .to_string(),
+            ),
+            timestamp_ms: 1_700_000_000_000,
+        };
+
+        let config = TelemetryConfig::new("https://ingest.example.test", "sk_test_abc");
+        let platform = convert_to_platform_event(&event, &config, None, None, None);
+
+        assert_eq!(
+            platform.payload["local_reliability_hint"]["recent_abort_rate"]
+                .as_f64()
+                .unwrap_or(-1.0),
+            0.75
+        );
+        assert_eq!(
+            platform.payload["local_reliability_hint"]["sample_size"].as_i64(),
+            Some(4)
+        );
+    }
+
+    #[test]
+    fn empty_local_reliability_hint_still_hoists_with_sample_size_zero() {
+        // Empty-window case: window has no entries yet. The SDK still
+        // emits (0.0, 0) so the platform can distinguish "no data" from
+        // "field missing because the SDK is older than the schema".
+        let event = TelemetryEvent {
+            event_type: "RoutingDecision".to_string(),
+            stage_name: Some("stage-1".to_string()),
+            target: Some("local".to_string()),
+            latency_ms: None,
+            error: None,
+            data: Some(
+                serde_json::json!({
+                    "stage": "stage-1",
+                    "target": "local",
+                    "reason": "default_local",
+                    "local_reliability_hint": {
+                        "recent_abort_rate": 0.0,
+                        "sample_size": 0_u32,
+                    }
+                })
+                .to_string(),
+            ),
+            timestamp_ms: 1_700_000_000_000,
+        };
+
+        let config = TelemetryConfig::new("https://ingest.example.test", "sk_test_abc");
+        let platform = convert_to_platform_event(&event, &config, None, None, None);
+
+        assert_eq!(
+            platform.payload["local_reliability_hint"]["sample_size"].as_i64(),
+            Some(0)
+        );
     }
 
     #[test]
@@ -2697,6 +2890,8 @@ mod tests {
             stage_name: "asr".to_string(),
             target: "cloud".to_string(),
             reason: "network_optimal".to_string(),
+            recent_abort_rate: 0.0,
+            sample_size: 0,
         };
         let telemetry = convert_orchestrator_event(&event);
 
@@ -2706,6 +2901,133 @@ mod tests {
         assert!(telemetry.data.is_some());
         let data = telemetry.data.unwrap();
         assert!(data.contains("network_optimal"));
+    }
+
+    #[test]
+    fn routing_decided_event_carries_local_reliability_hint_end_to_end() {
+        // Production-shape regression test: walk the full
+        // OrchestratorEvent -> TelemetryEvent -> PlatformEvent pipeline
+        // so the hint flows through every seam the previous PR draft
+        // missed.
+        let event = OrchestratorEvent::RoutingDecided {
+            stage_name: "stage-1".to_string(),
+            target: "cloud".to_string(),
+            reason: "history_bias".to_string(),
+            recent_abort_rate: 0.75,
+            sample_size: 4,
+        };
+        let telemetry_event = convert_orchestrator_event(&event);
+
+        // Bridge embeds the hint in event.data so the hoist list picks it up.
+        let data_str = telemetry_event.data.as_ref().expect("data must be present");
+        let parsed_data: serde_json::Value = serde_json::from_str(data_str).unwrap();
+        assert_eq!(
+            parsed_data["local_reliability_hint"]["recent_abort_rate"]
+                .as_f64()
+                .unwrap_or(-1.0),
+            0.75
+        );
+        assert_eq!(
+            parsed_data["local_reliability_hint"]["sample_size"].as_i64(),
+            Some(4)
+        );
+
+        // And the platform-event payload surfaces the hint at the top level.
+        let config = TelemetryConfig::new("https://ingest.example.test", "sk_test_abc");
+        let platform = convert_to_platform_event(&telemetry_event, &config, None, None, None);
+        assert_eq!(
+            platform.payload["local_reliability_hint"]["recent_abort_rate"]
+                .as_f64()
+                .unwrap_or(-1.0),
+            0.75
+        );
+        assert_eq!(
+            platform.payload["local_reliability_hint"]["sample_size"].as_i64(),
+            Some(4)
+        );
+    }
+
+    #[test]
+    fn routing_decided_event_sanitizes_non_finite_recent_abort_rate() {
+        // Defense-in-depth: the authority emits only finite rates, but
+        // the bridge clamps NaN/Infinity to 0.0 so the platform's typed
+        // Float32 column never receives a JSON null. The clamp lives in
+        // the bridge so any future direct OrchestratorEvent caller (test,
+        // example, FFI) cannot poison the telemetry stream.
+        for bad_rate in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let event = OrchestratorEvent::RoutingDecided {
+                stage_name: "stage-1".to_string(),
+                target: "cloud".to_string(),
+                reason: "history_bias".to_string(),
+                recent_abort_rate: bad_rate,
+                sample_size: 1,
+            };
+            let telemetry_event = convert_orchestrator_event(&event);
+            let parsed_data: serde_json::Value =
+                serde_json::from_str(telemetry_event.data.as_ref().unwrap()).unwrap();
+            assert_eq!(
+                parsed_data["local_reliability_hint"]["recent_abort_rate"].as_f64(),
+                Some(0.0),
+                "non-finite rate {bad_rate} must be sanitized to 0.0"
+            );
+        }
+    }
+
+    #[test]
+    fn scoped_orchestrator_bridge_drains_queued_events_with_captured_context() {
+        let (tx, rx) = mpsc::channel();
+        register_telemetry_sender(tx);
+
+        let orchestrator = xybrid_core::orchestrator::Orchestrator::new();
+        let pipeline_id = Uuid::new_v4();
+        let trace_id = Uuid::new_v4();
+        let bridge = subscribe_orchestrator_events_in_context(
+            &orchestrator,
+            Some(pipeline_id),
+            Some(trace_id),
+        );
+
+        orchestrator
+            .event_bus()
+            .publish(OrchestratorEvent::RoutingDecided {
+                stage_name: "stage-1".to_string(),
+                target: "cloud".to_string(),
+                reason: "history_bias".to_string(),
+                recent_abort_rate: 0.5,
+                sample_size: 2,
+            });
+        bridge.drain();
+
+        let mut received = None;
+        for _ in 0..20 {
+            match rx.recv_timeout(std::time::Duration::from_millis(50)) {
+                Ok(event) if event.event_type == "RoutingDecided" => {
+                    received = Some(event);
+                    break;
+                }
+                Ok(_) | Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    panic!("telemetry receiver disconnected before RoutingDecided arrived")
+                }
+            }
+        }
+        let received = received.expect("drained bridge should publish queued orchestrator event");
+
+        let data: serde_json::Value =
+            serde_json::from_str(received.data.as_ref().expect("context-bearing data")).unwrap();
+        assert_eq!(
+            data[CONTEXT_PIPELINE_ID_KEY],
+            serde_json::json!(pipeline_id)
+        );
+        assert_eq!(data[CONTEXT_TRACE_ID_KEY], serde_json::json!(trace_id));
+        assert_eq!(
+            data["local_reliability_hint"]["recent_abort_rate"].as_f64(),
+            Some(0.5)
+        );
+        assert_eq!(
+            data["local_reliability_hint"]["sample_size"].as_i64(),
+            Some(2)
+        );
     }
 
     #[test]
