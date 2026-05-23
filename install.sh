@@ -104,11 +104,12 @@ choose_install_dir() {
 # --- Download and install ---
 
 download_and_install() {
-  URL="https://github.com/$REPO/releases/download/${VERSION}/${ARTIFACT}"
+  XYBRID_VERSION="${XYBRID_VERSION:-0.1.0-rc3}"
+  URL="https://github.com/$REPO/releases/download/${XYBRID_VERSION}/${ARTIFACT}"
   TMPDIR=$(mktemp -d)
   TMPFILE="$TMPDIR/$BINARY_NAME"
 
-  info "Downloading xybrid ${VERSION} for ${PLATFORM}-${ARCH}..."
+  info "Downloading xybrid ${XYBRID_VERSION} for ${PLATFORM}-${ARCH}..."
 
   if command -v curl >/dev/null 2>&1; then
     HTTP_CODE=$(curl -sL -w "%{http_code}" -o "$TMPFILE" "$URL")
