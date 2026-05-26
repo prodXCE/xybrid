@@ -29,9 +29,8 @@ if (-not $Version) {
 }
 
 # --- Download ---
-$XybridVersion = if ($env:XYBRID_VERSION) { $env:XYBRID_VERSION } else { "0.1.0-rc3" }
-$Artifact = "$BinaryName-$XybridVersion-$Platform.exe"
-$Url = "https://github.com/$Repo/releases/download/$XybridVersion/$Artifact"
+$Artifact = "$BinaryName-$Version-$Platform.exe"
+$Url = "https://github.com/$Repo/releases/download/$Version/$Artifact"
 
 $InstallDir = "$env:USERPROFILE\.xybrid\bin"
 if (-not (Test-Path $InstallDir)) {
@@ -40,7 +39,7 @@ if (-not (Test-Path $InstallDir)) {
 
 $Dest = Join-Path $InstallDir "$BinaryName.exe"
 
-Write-Host "==> Downloading xybrid $XybridVersion for $Platform..." -ForegroundColor Blue
+Write-Host "==> Downloading xybrid $Version for $Platform..." -ForegroundColor Blue
 
 try {
     Invoke-WebRequest -Uri $Url -OutFile $Dest -UseBasicParsing
