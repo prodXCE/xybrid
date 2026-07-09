@@ -11,7 +11,8 @@
 //!
 //! # Example
 //!
-//! ```rust,ignore
+//! ```no_run
+//! # fn _example() -> Result<(), Box<dyn std::error::Error>> {
 //! use xybrid_sdk::registry_client::RegistryClient;
 //!
 //! let client = RegistryClient::default_client()?;
@@ -30,6 +31,8 @@
 //! let bundle_path = client.fetch("kokoro-82m", None, |progress| {
 //!     println!("Downloaded: {:.1}%", progress * 100.0);
 //! })?;
+//! # Ok(())
+//! # }
 //! ```
 
 use crate::cache::CacheManager;
@@ -37,7 +40,8 @@ use crate::model::SdkError;
 use crate::platform::current_platform;
 use crate::source::detect_platform;
 use crate::telemetry_optout::is_telemetry_opted_out;
-use crate::{get_binding, DEFAULT_BINDING};
+use crate::{get_binding, DEFAULT_BINDING, SDK_VERSION};
+use chrono::{DateTime, NaiveDateTime, Utc};
 use log::{debug, info, warn};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -47,10 +51,12 @@ use std::io::{BufReader, Read, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use xybrid_core::http::{CircuitBreaker, CircuitConfig, RetryPolicy, RetryableError};
+use xybrid_core::http::{CircuitBreaker, CircuitConfig, RetryPolicy};
 
 pub const DEFAULT_REGISTRY_URL: &str = "https://registry.xybrid.dev";
 pub const FALLBACK_REGISTRY_URL: &str = "https://r2.xybrid.dev";
+
+pub use crate::cache::{CacheEntryInfo, CacheEntryLocation};
 
 /// All registry URLs in priority order.
 pub const REGISTRY_URLS: &[&str] = &[DEFAULT_REGISTRY_URL, FALLBACK_REGISTRY_URL];
@@ -94,7 +100,7 @@ fn build_client_header_with_optout(binding: &str, opted_out: bool) -> Option<Str
     Some(format!(
         "binding={}; sdk_version={}; core_version={}; platform={}; backends={}",
         safe_binding,
-        env!("CARGO_PKG_VERSION"),
+        SDK_VERSION,
         xybrid_core::VERSION,
         current_platform(),
         backends,
@@ -147,6 +153,41 @@ const CONNECT_TIMEOUT_MS: u64 = 5000;
 
 /// Request timeout in milliseconds.
 const REQUEST_TIMEOUT_MS: u64 = 15000;
+
+/// Default retry delay when a 429 response omits or mangles Retry-After.
+const DEFAULT_RATE_LIMIT_RETRY_AFTER_SECS: u64 = 60;
+
+/// Cap Retry-After to avoid a registry hint sleeping the client indefinitely.
+const MAX_RATE_LIMIT_RETRY_AFTER_SECS: u64 = 5 * 60;
+
+fn rate_limit_retry_after_secs(retry_after: Option<&str>) -> u64 {
+    rate_limit_retry_after_secs_at(retry_after, Utc::now())
+}
+
+fn rate_limit_retry_after_secs_at(retry_after: Option<&str>, now: DateTime<Utc>) -> u64 {
+    let Some(value) = retry_after.map(str::trim).filter(|value| !value.is_empty()) else {
+        return DEFAULT_RATE_LIMIT_RETRY_AFTER_SECS;
+    };
+
+    if let Ok(seconds) = value.parse::<u64>() {
+        return seconds.min(MAX_RATE_LIMIT_RETRY_AFTER_SECS);
+    }
+
+    parse_retry_after_http_date(value, now).unwrap_or(DEFAULT_RATE_LIMIT_RETRY_AFTER_SECS)
+}
+
+fn parse_retry_after_http_date(value: &str, now: DateTime<Utc>) -> Option<u64> {
+    let parsed = DateTime::parse_from_rfc2822(value)
+        .map(|date| date.with_timezone(&Utc))
+        .or_else(|_| {
+            NaiveDateTime::parse_from_str(value, "%a, %d %b %Y %H:%M:%S GMT")
+                .map(|date| DateTime::<Utc>::from_naive_utc_and_offset(date, Utc))
+        })
+        .ok()?;
+
+    let seconds = parsed.signed_duration_since(now).num_seconds().max(0) as u64;
+    Some(seconds.min(MAX_RATE_LIMIT_RETRY_AFTER_SECS))
+}
 
 /// Registry client for model resolution and download.
 pub struct RegistryClient {
@@ -300,7 +341,7 @@ impl RegistryClient {
         .and_then(|response| {
             let list_response: ListModelsResponse = response
                 .into_json()
-                .map_err(|e| SdkError::NetworkError(format!("Failed to parse response: {}", e)))?;
+                .map_err(|e| SdkError::network_src("Failed to parse response", e))?;
             Ok(list_response.models)
         })
     }
@@ -321,7 +362,7 @@ impl RegistryClient {
         .and_then(|response| {
             response
                 .into_json()
-                .map_err(|e| SdkError::NetworkError(format!("Failed to parse response: {}", e)))
+                .map_err(|e| SdkError::network_src("Failed to parse response", e))
         })
     }
 
@@ -350,7 +391,7 @@ impl RegistryClient {
         .and_then(|response| {
             let resolve_response: ResolveResponse = response
                 .into_json()
-                .map_err(|e| SdkError::NetworkError(format!("Failed to parse response: {}", e)))?;
+                .map_err(|e| SdkError::network_src("Failed to parse response", e))?;
             Ok(resolve_response.resolved)
         })
     }
@@ -391,9 +432,8 @@ impl RegistryClient {
             }
         }
 
-        Err(last_error.unwrap_or_else(|| {
-            SdkError::NetworkError("All registry URLs failed or circuits open".to_string())
-        }))
+        Err(last_error
+            .unwrap_or_else(|| SdkError::network("All registry URLs failed or circuits open")))
     }
 
     /// Execute an operation with retry for a specific URL.
@@ -443,7 +483,7 @@ impl RegistryClient {
                     // online), and skip the retry loop within this URL since
                     // backoff won't help a DNS failure. Return immediately and
                     // let `execute_with_fallback` try the next URL.
-                    if matches!(&err, SdkError::Offline(_)) {
+                    if matches!(&err, SdkError::Offline { .. }) {
                         return Err(err);
                     }
 
@@ -465,7 +505,7 @@ impl RegistryClient {
         }
 
         Err(last_error.unwrap_or_else(|| {
-            SdkError::NetworkError(format!("All retry attempts exhausted for {}", api_url))
+            SdkError::network(format!("All retry attempts exhausted for {}", api_url))
         }))
     }
 
@@ -480,7 +520,7 @@ impl RegistryClient {
                 if resp.status() == 200 {
                     Ok(resp)
                 } else {
-                    Err(self.status_to_error(resp.status(), operation))
+                    Err(self.response_status_to_error(&resp, operation))
                 }
             }
             Err(e) => Err(self.ureq_error_to_sdk_error(e, operation)),
@@ -504,7 +544,7 @@ impl RegistryClient {
                 } else if resp.status() == 404 {
                     Err(not_found_err())
                 } else {
-                    Err(self.status_to_error(resp.status(), operation))
+                    Err(self.response_status_to_error(&resp, operation))
                 }
             }
             Err(ureq::Error::Status(404, _)) => Err(not_found_err()),
@@ -512,16 +552,18 @@ impl RegistryClient {
         }
     }
 
+    /// Convert an HTTP response status and headers to SdkError.
+    fn response_status_to_error(&self, response: &ureq::Response, operation: &str) -> SdkError {
+        self.status_to_error(response.status(), operation, response.header("Retry-After"))
+    }
+
     /// Convert HTTP status code to SdkError.
-    fn status_to_error(&self, status: u16, operation: &str) -> SdkError {
+    fn status_to_error(&self, status: u16, operation: &str, retry_after: Option<&str>) -> SdkError {
         match status {
-            429 => {
-                // TODO: Parse Retry-After header when available
-                SdkError::RateLimited {
-                    retry_after_secs: 60,
-                }
-            }
-            502..=504 => SdkError::NetworkError(format!(
+            429 => SdkError::RateLimited {
+                retry_after_secs: rate_limit_retry_after_secs(retry_after),
+            },
+            502..=504 => SdkError::network(format!(
                 "Registry {} failed with status {} (server error)",
                 operation, status
             )),
@@ -529,9 +571,7 @@ impl RegistryClient {
                 "Registry {} failed with status {} (client error)",
                 operation, status
             )),
-            _ => {
-                SdkError::NetworkError(format!("Registry {} returned status {}", operation, status))
-            }
+            _ => SdkError::network(format!("Registry {} returned status {}", operation, status)),
         }
     }
 
@@ -544,24 +584,28 @@ impl RegistryClient {
     /// toward the failure threshold (see `execute_with_retry_for_url`).
     fn ureq_error_to_sdk_error(&self, error: ureq::Error, operation: &str) -> SdkError {
         match error {
-            ureq::Error::Status(status, _) => self.status_to_error(status, operation),
+            ureq::Error::Status(status, response) => {
+                self.status_to_error(status, operation, response.header("Retry-After"))
+            }
             ureq::Error::Transport(transport) => {
                 let kind = transport.kind();
                 match kind {
-                    ureq::ErrorKind::Dns => SdkError::Offline(format!(
-                        "Failed to {} (DNS resolution failed)",
-                        operation
-                    )),
-                    ureq::ErrorKind::ConnectionFailed => SdkError::Offline(format!(
-                        "Failed to {} (connection refused or host unreachable)",
-                        operation
-                    )),
-                    ureq::ErrorKind::Io => SdkError::Offline(format!(
-                        "Failed to {} (network I/O error: {})",
-                        operation,
-                        transport.message().unwrap_or("unknown")
-                    )),
-                    _ => SdkError::NetworkError(format!("Failed to {}: {}", operation, transport)),
+                    ureq::ErrorKind::Dns => SdkError::offline_src(
+                        format!("Failed to {} (DNS resolution failed)", operation),
+                        transport,
+                    ),
+                    ureq::ErrorKind::ConnectionFailed => SdkError::offline_src(
+                        format!(
+                            "Failed to {} (connection refused or host unreachable)",
+                            operation
+                        ),
+                        transport,
+                    ),
+                    ureq::ErrorKind::Io => SdkError::offline_src(
+                        format!("Failed to {} (network I/O error)", operation),
+                        transport,
+                    ),
+                    _ => SdkError::network_src(format!("Failed to {}", operation), transport),
                 }
             }
         }
@@ -587,14 +631,8 @@ impl RegistryClient {
 
     /// Get the local cache path for a resolved variant.
     pub fn get_cache_path(&self, resolved: &ResolvedVariant) -> PathBuf {
-        // Extract model name from hf_repo (e.g., "xybrid-ai/kokoro-82m" -> "kokoro-82m")
-        let model_name = resolved
-            .hf_repo
-            .split('/')
-            .next_back()
-            .unwrap_or(&resolved.hf_repo);
-
-        self.cache.cache_dir().join(model_name).join(&resolved.file)
+        self.cache
+            .registry_bundle_path(&resolved.hf_repo, &resolved.file)
     }
 
     /// Fetch a model bundle, downloading if not cached.
@@ -712,7 +750,7 @@ impl RegistryClient {
             let hash = compute_sha256(&cache_path)?;
             if hash != resolved.sha256 {
                 std::fs::remove_file(&cache_path).ok();
-                return Err(SdkError::CacheError(format!(
+                return Err(SdkError::cache(format!(
                     "SHA256 mismatch: expected {}, got {}",
                     resolved.sha256, hash
                 )));
@@ -758,7 +796,9 @@ impl RegistryClient {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
+    /// ```no_run
+    /// # fn _example() -> Result<(), Box<dyn std::error::Error>> {
+    /// # use xybrid_sdk::RegistryClient;
     /// let client = RegistryClient::default_client()?;
     /// let model_dir = client.fetch_extracted("kokoro-82m", None, |p| {
     ///     println!("Downloaded: {:.1}%", p * 100.0);
@@ -766,6 +806,8 @@ impl RegistryClient {
     ///
     /// // model_dir now contains model_metadata.json and all model files
     /// let metadata_path = model_dir.join("model_metadata.json");
+    /// # Ok(())
+    /// # }
     /// ```
     pub fn fetch_extracted<F>(
         &self,
@@ -820,97 +862,168 @@ impl RegistryClient {
         let metadata_path = extract_dir.join("model_metadata.json");
 
         // Idempotency check: if model file + metadata exist, check cache validity
-        if model_file_path.exists() && metadata_path.exists() {
-            if resolved.sha256.is_empty() {
-                // No hash to verify — trust existing files
-                warn!(
-                    "Passthrough cache hit for '{}' (no hash verification) at {}",
-                    mask,
-                    extract_dir.display()
-                );
-                return Ok(extract_dir);
+        if metadata_path.exists() {
+            let mut cache_valid =
+                self.passthrough_file_is_valid(&model_file_path, &resolved.sha256)?;
+            for artifact in &resolved.artifacts {
+                let artifact_path = extract_dir.join(&artifact.file);
+                cache_valid &= self.passthrough_file_is_valid(&artifact_path, &artifact.sha256)?;
             }
-            if let Some(cached_hash) = read_cached_hash(&model_file_path) {
-                if cached_hash == resolved.sha256 {
+
+            if cache_valid {
+                if resolved.sha256.is_empty()
+                    || resolved
+                        .artifacts
+                        .iter()
+                        .any(|artifact| artifact.sha256.is_empty())
+                {
+                    warn!(
+                        "Passthrough cache hit for '{}' (one or more files lack hash verification) at {}",
+                        mask,
+                        extract_dir.display()
+                    );
+                } else {
                     info!(
                         "Passthrough cache hit for '{}' at {}",
                         mask,
                         extract_dir.display()
                     );
-                    return Ok(extract_dir);
                 }
-                info!("Passthrough hash mismatch for '{}', re-downloading", mask);
+                return Ok(extract_dir);
             }
+            info!(
+                "Passthrough cache incomplete or hash mismatch for '{}', re-downloading",
+                mask
+            );
         }
 
         // Create extraction directory
-        std::fs::create_dir_all(&extract_dir).map_err(|e| {
-            SdkError::CacheError(format!("Failed to create extraction directory: {}", e))
-        })?;
+        std::fs::create_dir_all(&extract_dir)
+            .map_err(|e| SdkError::cache_src("Failed to create extraction directory", e))?;
 
-        // Download raw model file directly to extraction dir
-        info!(
-            "Passthrough download '{}' from {}",
-            mask, resolved.download_url
-        );
-        // Same reasoning as the standard fetch path: we time the
-        // network transfer alone so the cost dashboard sees a clean
-        // bytes-on-the-wire signal.
-        let download_started = Instant::now();
-        self.download_with_progress(
+        self.download_passthrough_file(
+            mask,
+            &resolved.file,
             &resolved.download_url,
             &model_file_path,
             resolved.size_bytes,
             &progress_callback,
+            &resolved.sha256,
         )?;
-        let download_duration = download_started.elapsed();
 
-        let bytes_downloaded = std::fs::metadata(&model_file_path)
-            .map(|m| m.len())
-            .unwrap_or(resolved.size_bytes);
-        crate::telemetry::publish_model_download(
-            mask,
-            bytes_downloaded,
-            classify_download_source(&resolved.download_url),
-            download_duration.as_millis().min(u32::MAX as u128) as u32,
-        );
-
-        // Verify SHA256
-        if !resolved.sha256.is_empty() {
-            let hash = compute_sha256(&model_file_path)?;
-            if hash != resolved.sha256 {
-                std::fs::remove_file(&model_file_path).ok();
-                return Err(SdkError::CacheError(format!(
-                    "Passthrough SHA256 mismatch: expected {}, got {}",
-                    resolved.sha256, hash
-                )));
-            }
-            // Cache the verified hash
-            write_cached_hash(&model_file_path, &hash);
-            info!("Passthrough SHA256 verified for '{}'", mask);
+        // Note: download_passthrough_file already handles telemetry + SHA256 per file.
+        // Download additional artifacts (e.g. mmproj for VLM models)
+        for artifact in &resolved.artifacts {
+            let artifact_path = extract_dir.join(&artifact.file);
+            self.download_passthrough_file(
+                mask,
+                &artifact.file,
+                &artifact.download_url,
+                &artifact_path,
+                artifact.size_bytes,
+                &progress_callback,
+                &artifact.sha256,
+            )?;
         }
 
         // Write model_metadata.json from registry response
         if let Some(ref metadata) = resolved.model_metadata {
-            let metadata_json = serde_json::to_string_pretty(metadata).map_err(|e| {
-                SdkError::CacheError(format!("Failed to serialize model metadata: {}", e))
-            })?;
-            std::fs::write(&metadata_path, metadata_json).map_err(|e| {
-                SdkError::CacheError(format!("Failed to write model_metadata.json: {}", e))
-            })?;
+            let metadata_json = serde_json::to_string_pretty(metadata)
+                .map_err(|e| SdkError::cache_src("Failed to serialize model metadata", e))?;
+            std::fs::write(&metadata_path, metadata_json)
+                .map_err(|e| SdkError::cache_src("Failed to write model_metadata.json", e))?;
             info!(
                 "Wrote model_metadata.json for passthrough model '{}' at {}",
                 mask,
                 metadata_path.display()
             );
         } else {
-            return Err(SdkError::CacheError(format!(
+            return Err(SdkError::cache(format!(
                 "Passthrough variant for '{}' has no model_metadata in registry response",
                 mask
             )));
         }
 
         Ok(extract_dir)
+    }
+
+    fn passthrough_file_is_valid(
+        &self,
+        file_path: &PathBuf,
+        expected_sha256: &str,
+    ) -> Result<bool, SdkError> {
+        if !file_path.exists() {
+            return Ok(false);
+        }
+        if expected_sha256.is_empty() {
+            return Ok(true);
+        }
+        if let Some(cached_hash) = read_cached_hash(file_path) {
+            return Ok(cached_hash == expected_sha256);
+        }
+        let computed = compute_sha256(file_path)?;
+        let matches = computed == expected_sha256;
+        if matches {
+            write_cached_hash(file_path, &computed);
+        }
+        Ok(matches)
+    }
+
+    fn download_passthrough_file<F>(
+        &self,
+        mask: &str,
+        file_name: &str,
+        download_url: &str,
+        dest: &PathBuf,
+        size_bytes: u64,
+        progress_callback: &F,
+        expected_sha256: &str,
+    ) -> Result<(), SdkError>
+    where
+        F: Fn(f32),
+    {
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        info!(
+            "Passthrough download '{}' file '{}' from {}",
+            mask, file_name, download_url
+        );
+        // Same reasoning as the standard fetch path: we time the
+        // network transfer alone so the cost dashboard sees a clean
+        // bytes-on-the-wire signal.
+        let download_started = Instant::now();
+        self.download_with_progress(download_url, dest, size_bytes, progress_callback)?;
+        let download_duration = download_started.elapsed();
+
+        let bytes_downloaded = std::fs::metadata(dest)
+            .map(|m| m.len())
+            .unwrap_or(size_bytes);
+        crate::telemetry::publish_model_download(
+            mask,
+            bytes_downloaded,
+            classify_download_source(download_url),
+            download_duration.as_millis().min(u32::MAX as u128) as u32,
+        );
+
+        if !expected_sha256.is_empty() {
+            let hash = compute_sha256(dest)?;
+            if hash != expected_sha256 {
+                std::fs::remove_file(dest).ok();
+                return Err(SdkError::cache(format!(
+                    "Passthrough SHA256 mismatch for '{}': expected {}, got {}",
+                    file_name, expected_sha256, hash
+                )));
+            }
+            write_cached_hash(dest, &hash);
+            info!(
+                "Passthrough SHA256 verified for '{}' file '{}'",
+                mask, file_name
+            );
+        }
+
+        Ok(())
     }
 
     /// Check if a model is already extracted and ready to use.
@@ -938,11 +1051,7 @@ impl RegistryClient {
     /// prefer this over `resolve()` + `fetch()` when they don't need to check for
     /// registry updates.
     pub fn resolve_offline(&self, mask: &str) -> Option<PathBuf> {
-        if self.cache.is_extracted(mask) {
-            Some(self.cache.extraction_dir(mask))
-        } else {
-            None
-        }
+        self.cache.existing_extraction_dir(mask)
     }
 
     /// List all model IDs that are currently available for offline use.
@@ -1001,9 +1110,8 @@ impl RegistryClient {
             }
         }
 
-        Err(last_error.unwrap_or_else(|| {
-            SdkError::NetworkError("Download failed after all retry attempts".to_string())
-        }))
+        Err(last_error
+            .unwrap_or_else(|| SdkError::network("Download failed after all retry attempts")))
     }
 
     /// Attempt a single download.
@@ -1029,7 +1137,7 @@ impl RegistryClient {
             .map_err(|e| self.ureq_error_to_sdk_error(e, "download bundle"))?;
 
         if response.status() != 200 {
-            return Err(self.status_to_error(response.status(), "download bundle"));
+            return Err(self.response_status_to_error(&response, "download bundle"));
         }
 
         let mut file = File::create(dest)?;
@@ -1040,7 +1148,7 @@ impl RegistryClient {
         loop {
             let bytes_read = reader
                 .read(&mut buffer)
-                .map_err(|e| SdkError::NetworkError(format!("Read error: {}", e)))?;
+                .map_err(|e| SdkError::network_src("Read error", e))?;
 
             if bytes_read == 0 {
                 break;
@@ -1061,43 +1169,62 @@ impl RegistryClient {
     }
 
     /// Clear the local cache for a specific model.
-    pub fn clear_cache(&self, mask: &str) -> Result<(), SdkError> {
-        let model_dir = self.cache.cache_dir().join(mask);
-        if model_dir.exists() {
-            std::fs::remove_dir_all(&model_dir)?;
-        }
-        Ok(())
+    ///
+    /// # Returns
+    ///
+    /// The number of cache roots removed for `mask` across all managed cache
+    /// areas (registry bundle, extracted runtime cache, HuggingFace
+    /// downloads). Returns `0` when the model was not cached.
+    ///
+    /// # Concurrency
+    ///
+    /// Not safe to run concurrently with a load of the same model: it removes
+    /// whole cache directories that an in-flight extraction may be writing to.
+    pub fn clear_cache(&mut self, mask: &str) -> Result<u32, SdkError> {
+        self.cache.clear_model_roots(mask)
     }
 
     /// Clear the entire model cache.
-    pub fn clear_all_cache(&mut self) -> Result<(), SdkError> {
-        self.cache
-            .clear()
-            .map_err(|e| SdkError::CacheError(e.to_string()))?;
-        Ok(())
+    ///
+    /// # Returns
+    ///
+    /// The number of cache roots removed across all managed cache areas.
+    /// Returns `0` when nothing was cached.
+    ///
+    /// # Concurrency
+    ///
+    /// Not safe to run concurrently with any model load: it removes whole
+    /// cache directories that in-flight downloads or extractions may be
+    /// writing to.
+    pub fn clear_all_cache(&mut self) -> Result<u32, SdkError> {
+        self.cache.clear()
     }
 
-    /// Get cache statistics.
+    /// Get aggregate cache statistics across all managed model cache roots.
     pub fn cache_stats(&self) -> Result<CacheStats, SdkError> {
-        let cache_dir = self.cache.cache_dir();
-        let mut total_size: u64 = 0;
-        let mut model_count: usize = 0;
-
-        if cache_dir.exists() {
-            for entry in std::fs::read_dir(cache_dir)? {
-                let entry = entry?;
-                if entry.path().is_dir() {
-                    model_count += 1;
-                    total_size += dir_size(&entry.path())?;
-                }
-            }
-        }
+        let entries = self.cache_entries()?;
+        let total_size = entries.iter().map(|entry| entry.size_bytes).sum();
 
         Ok(CacheStats {
             total_size_bytes: total_size,
-            model_count,
-            cache_path: cache_dir.to_path_buf(),
+            model_count: entries.len(),
+            cache_path: self.cache.cache_dir().to_path_buf(),
         })
+    }
+
+    /// Return the root directory that owns all managed model cache locations.
+    pub fn cache_root(&self) -> PathBuf {
+        crate::cache::layout::CacheLayout::from_registry_root(self.cache.cache_dir().to_path_buf())
+            .cache_root()
+            .to_path_buf()
+    }
+
+    /// List cached model entries across all managed cache roots.
+    ///
+    /// Includes the legacy registry bundle cache and runtime caches such as
+    /// extracted bundles and direct Hugging Face downloads.
+    pub fn cache_entries(&self) -> Result<Vec<CacheEntryInfo>, SdkError> {
+        self.cache.cache_entries()
     }
 }
 
@@ -1172,21 +1299,6 @@ fn write_cached_hash(bundle_path: &PathBuf, hash: &str) {
 fn remove_cached_hash(bundle_path: &PathBuf) {
     let hash_path = hash_cache_path(bundle_path);
     let _ = std::fs::remove_file(&hash_path);
-}
-
-/// Calculate total size of a directory.
-fn dir_size(path: &PathBuf) -> Result<u64, SdkError> {
-    let mut total: u64 = 0;
-    for entry in std::fs::read_dir(path)? {
-        let entry = entry?;
-        let metadata = entry.metadata()?;
-        if metadata.is_file() {
-            total += metadata.len();
-        } else if metadata.is_dir() {
-            total += dir_size(&entry.path())?;
-        }
-    }
-    Ok(total)
 }
 
 // ============================================================================
@@ -1279,6 +1391,9 @@ pub struct ResolvedVariant {
     pub size_bytes: u64,
     /// SHA256 hash for verification
     pub sha256: String,
+    /// Additional files required by this variant, such as VLM mmproj siblings.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub artifacts: Vec<ResolvedArtifact>,
     /// Whether this is a passthrough variant (direct download, no .xyb bundle)
     #[serde(default)]
     pub passthrough: bool,
@@ -1287,21 +1402,46 @@ pub struct ResolvedVariant {
     pub model_metadata: Option<serde_json::Value>,
 }
 
-/// Cache statistics.
+/// Additional resolved artifact required alongside the primary variant file.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResolvedArtifact {
+    /// Local file path relative to the extracted model directory.
+    pub file: String,
+    /// Direct download URL.
+    pub download_url: String,
+    /// Expected size in bytes.
+    pub size_bytes: u64,
+    /// Expected SHA256 hash. Empty means no hash verification is available.
+    #[serde(default)]
+    pub sha256: String,
+}
+
+/// Aggregate cache statistics across all managed model cache roots.
 #[derive(Debug, Clone)]
 pub struct CacheStats {
-    /// Total size of cached bundles in bytes
+    /// Total size of cached model entries in bytes.
     pub total_size_bytes: u64,
-    /// Number of cached models
+    /// Number of cached model entries across managed cache roots.
     pub model_count: usize,
-    /// Path to cache directory
+    /// Path to the legacy registry bundle cache directory.
     pub cache_path: PathBuf,
 }
 
 impl CacheStats {
+    /// Return the root directory that owns all managed model cache locations.
+    pub fn cache_root(&self) -> PathBuf {
+        crate::cache::layout::CacheLayout::from_registry_root(self.cache_path.clone())
+            .cache_root()
+            .to_path_buf()
+    }
+
     /// Get human-readable size.
     pub fn total_size_human(&self) -> String {
-        let bytes = self.total_size_bytes;
+        Self::format_size(self.total_size_bytes)
+    }
+
+    /// Format a byte size using the cache summary display convention.
+    pub fn format_size(bytes: u64) -> String {
         if bytes < 1024 {
             format!("{} B", bytes)
         } else if bytes < 1024 * 1024 {
@@ -1317,6 +1457,53 @@ impl CacheStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
+
+    fn create_vlm_bundle(temp_dir: &tempfile::TempDir, model_id: &str) -> PathBuf {
+        let model_dir = temp_dir.path().join("bundle_model_files");
+        std::fs::create_dir_all(&model_dir).unwrap();
+
+        let metadata = format!(
+            r#"{{
+                "model_id": "{}",
+                "version": "1.0",
+                "execution_template": {{
+                    "type": "VisionLanguage",
+                    "model_file": "model.gguf"
+                }},
+                "vision_encoder": {{
+                    "file": "mmproj-model.gguf",
+                    "preprocessing_preset": "gemma3_vision",
+                    "image_size": 896
+                }},
+                "preprocessing": [],
+                "postprocessing": [],
+                "files": ["model.gguf", "mmproj-model.gguf"],
+                "metadata": {{ "task": "vlm" }}
+            }}"#,
+            model_id
+        );
+        std::fs::write(model_dir.join("model_metadata.json"), &metadata).unwrap();
+        std::fs::write(model_dir.join("model.gguf"), b"fake language model").unwrap();
+        std::fs::write(
+            model_dir.join("mmproj-model.gguf"),
+            b"fake vision projector",
+        )
+        .unwrap();
+
+        let mut bundle = xybrid_core::bundler::XyBundle::new(model_id, "1.0", "universal");
+        bundle
+            .add_file(model_dir.join("model_metadata.json"))
+            .unwrap();
+        bundle.add_file(model_dir.join("model.gguf")).unwrap();
+        bundle
+            .add_file(model_dir.join("mmproj-model.gguf"))
+            .unwrap();
+
+        let bundle_path = temp_dir.path().join(format!("{}.xyb", model_id));
+        bundle.write(&bundle_path).unwrap();
+        bundle_path
+    }
 
     #[test]
     fn classify_download_source_recognises_r2_hosts() {
@@ -1363,6 +1550,386 @@ mod tests {
             "other"
         );
         assert_eq!(classify_download_source(""), "other");
+    }
+
+    #[test]
+    fn resolved_variant_preserves_passthrough_sibling_artifacts() {
+        let resolved: ResolvedVariant = serde_json::from_str(
+            r#"
+{
+  "hf_repo": "xybrid-ai/vlm",
+  "file": "model.gguf",
+  "download_url": "https://example.com/model.gguf",
+  "format": "gguf",
+  "quantization": "q4_k_m",
+  "size_bytes": 10,
+  "sha256": "model-hash",
+  "passthrough": true,
+  "artifacts": [
+    {
+      "file": "mmproj-model.gguf",
+      "download_url": "https://example.com/mmproj-model.gguf",
+      "size_bytes": 5,
+      "sha256": "mmproj-hash"
+    }
+  ],
+  "model_metadata": {
+    "model_id": "vlm",
+    "version": "1.0",
+    "execution_template": { "type": "VisionLanguage", "model_file": "model.gguf" },
+    "vision_encoder": {
+      "file": "mmproj-model.gguf",
+      "preprocessing_preset": "gemma3_vision",
+      "image_size": 896
+    },
+    "files": ["model.gguf", "mmproj-model.gguf"],
+    "metadata": {}
+  }
+}
+"#,
+        )
+        .unwrap();
+
+        let roundtrip = serde_json::to_value(&resolved).unwrap();
+        let artifacts = roundtrip
+            .get("artifacts")
+            .and_then(|value| value.as_array())
+            .expect("resolved passthrough variant must keep sibling artifact descriptors");
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(artifacts[0]["file"], "mmproj-model.gguf");
+        assert_eq!(
+            artifacts[0]["download_url"],
+            "https://example.com/mmproj-model.gguf"
+        );
+        assert_eq!(artifacts[0]["sha256"], "mmproj-hash");
+    }
+
+    #[test]
+    fn fetch_extracted_passthrough_downloads_sibling_artifacts() {
+        use httpmock::prelude::*;
+        use sha2::{Digest, Sha256};
+
+        fn sha256_hex(bytes: &[u8]) -> String {
+            let mut hasher = Sha256::new();
+            hasher.update(bytes);
+            format!("{:x}", hasher.finalize())
+        }
+
+        let server = MockServer::start();
+        let model_bytes = b"main model";
+        let mmproj_bytes = b"vision projector";
+        let model_hash = sha256_hex(model_bytes);
+        let mmproj_hash = sha256_hex(mmproj_bytes);
+
+        let model_mock = server.mock(|when, then| {
+            when.method(GET).path("/model.gguf");
+            then.status(200).body(model_bytes.as_slice());
+        });
+        let mmproj_mock = server.mock(|when, then| {
+            when.method(GET).path("/mmproj-model.gguf");
+            then.status(200).body(mmproj_bytes.as_slice());
+        });
+
+        let resolve_body = serde_json::json!({
+            "mask": "vlm",
+            "platform": "universal",
+            "resolved": {
+                "hf_repo": "xybrid-ai/vlm",
+                "file": "model.gguf",
+                "download_url": server.url("/model.gguf"),
+                "format": "gguf",
+                "quantization": "q4_k_m",
+                "size_bytes": model_bytes.len(),
+                "sha256": model_hash,
+                "passthrough": true,
+                "artifacts": [
+                    {
+                        "file": "mmproj-model.gguf",
+                        "download_url": server.url("/mmproj-model.gguf"),
+                        "size_bytes": mmproj_bytes.len(),
+                        "sha256": mmproj_hash
+                    }
+                ],
+                "model_metadata": {
+                    "model_id": "vlm",
+                    "version": "1.0",
+                    "execution_template": {
+                        "type": "VisionLanguage",
+                        "model_file": "model.gguf"
+                    },
+                    "vision_encoder": {
+                        "file": "mmproj-model.gguf",
+                        "preprocessing_preset": "gemma3_vision",
+                        "image_size": 896
+                    },
+                    "files": ["model.gguf", "mmproj-model.gguf"],
+                    "metadata": {}
+                }
+            }
+        });
+        let resolve_mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/models/vlm/resolve")
+                .query_param_exists("platform");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(resolve_body);
+        });
+
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let cache_dir = temp_dir.path().join("cache").join("models");
+        let mut client = RegistryClient::with_url(server.base_url()).unwrap();
+        client.cache = CacheManager::with_dir(cache_dir).unwrap();
+
+        let model_dir = client
+            .fetch_extracted("vlm", Some("universal"), |_| {})
+            .expect("passthrough VLM fetch should materialize all artifacts");
+
+        assert_eq!(
+            std::fs::read(model_dir.join("model.gguf")).unwrap(),
+            model_bytes
+        );
+        assert_eq!(
+            std::fs::read(model_dir.join("mmproj-model.gguf")).unwrap(),
+            mmproj_bytes
+        );
+        assert!(
+            model_dir.join("model_metadata.json").exists(),
+            "metadata must be written next to passthrough artifacts"
+        );
+        assert_eq!(
+            read_cached_hash(&model_dir.join("model.gguf")).as_deref(),
+            Some(model_hash.as_str())
+        );
+        assert_eq!(
+            read_cached_hash(&model_dir.join("mmproj-model.gguf")).as_deref(),
+            Some(mmproj_hash.as_str())
+        );
+
+        resolve_mock.assert();
+        model_mock.assert();
+        mmproj_mock.assert();
+    }
+
+    #[test]
+    fn fetch_extracted_bundle_repairs_partial_multifile_vlm_extraction() {
+        use httpmock::prelude::*;
+        use sha2::{Digest, Sha256};
+
+        fn sha256_hex(bytes: &[u8]) -> String {
+            let mut hasher = Sha256::new();
+            hasher.update(bytes);
+            format!("{:x}", hasher.finalize())
+        }
+
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let bundle_path = create_vlm_bundle(&temp_dir, "vlm-bundle");
+        let bundle_bytes = std::fs::read(&bundle_path).unwrap();
+        let bundle_hash = sha256_hex(&bundle_bytes);
+
+        let server = MockServer::start();
+        let bundle_mock = server.mock(|when, then| {
+            when.method(GET).path("/universal.xyb");
+            then.status(200).body(bundle_bytes.clone());
+        });
+        let resolve_body = serde_json::json!({
+            "mask": "vlm-bundle",
+            "platform": "universal",
+            "resolved": {
+                "hf_repo": "xybrid-ai/vlm-bundle",
+                "file": "universal.xyb",
+                "download_url": server.url("/universal.xyb"),
+                "format": "gguf",
+                "quantization": "q4_k_m",
+                "size_bytes": bundle_bytes.len(),
+                "sha256": bundle_hash
+            }
+        });
+        let resolve_mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/models/vlm-bundle/resolve")
+                .query_param_exists("platform");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(resolve_body);
+        });
+
+        let cache_dir = temp_dir.path().join("cache").join("models");
+        let mut client = RegistryClient::with_url(server.base_url()).unwrap();
+        client.cache = CacheManager::with_dir(cache_dir).unwrap();
+
+        let partial_dir = client.cache.extraction_dir("vlm-bundle");
+        std::fs::create_dir_all(&partial_dir).unwrap();
+        let bundle = xybrid_core::bundler::XyBundle::load(&bundle_path).unwrap();
+        let metadata_json = bundle.get_metadata_json().unwrap().unwrap();
+        std::fs::write(partial_dir.join("model_metadata.json"), metadata_json).unwrap();
+
+        let model_dir = client
+            .fetch_extracted("vlm-bundle", Some("universal"), |_| {})
+            .expect("bundle VLM fetch should repair partial extraction and materialize siblings");
+
+        assert_eq!(model_dir, partial_dir);
+        assert!(model_dir.join("model_metadata.json").exists());
+        assert_eq!(
+            std::fs::read(model_dir.join("model.gguf")).unwrap(),
+            b"fake language model"
+        );
+        assert_eq!(
+            std::fs::read(model_dir.join("mmproj-model.gguf")).unwrap(),
+            b"fake vision projector"
+        );
+        assert!(client.is_extracted("vlm-bundle"));
+
+        resolve_mock.assert_hits(2);
+        bundle_mock.assert();
+    }
+
+    #[test]
+    fn cache_entries_include_extracted_runtime_cache() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let cache_root = temp_dir.path().join("cache");
+        let models_dir = cache_root.join("models");
+        let extracted_model_dir = cache_root.join("extracted").join("lfm2.5-350m");
+        let metadata = br#"{"files":[]}"#;
+        let weights = b"fake weights";
+        std::fs::create_dir_all(&extracted_model_dir).unwrap();
+        std::fs::write(extracted_model_dir.join("model_metadata.json"), metadata).unwrap();
+        std::fs::write(extracted_model_dir.join("LFM2.5-350M-Q4_K_M.gguf"), weights).unwrap();
+
+        let mut client = RegistryClient::with_url("https://example.test").unwrap();
+        client.cache = CacheManager::with_dir(models_dir).unwrap();
+
+        let entries = client.cache_entries().unwrap();
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].model_id, "lfm2.5-350m");
+        assert_eq!(entries[0].location, CacheEntryLocation::Extracted);
+        assert_eq!(entries[0].path, extracted_model_dir);
+        assert_eq!(
+            entries[0].size_bytes,
+            (metadata.len() + weights.len()) as u64
+        );
+
+        let stats = client.cache_stats().unwrap();
+        assert_eq!(stats.model_count, 1);
+        assert_eq!(stats.cache_root(), cache_root);
+        assert_eq!(
+            stats.total_size_bytes,
+            (metadata.len() + weights.len()) as u64
+        );
+    }
+
+    #[test]
+    fn cache_entries_include_all_managed_cache_roots() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let cache_root = temp_dir.path().join("cache");
+        let models_dir = cache_root.join("models");
+        let registry_model_dir = models_dir.join("registry-model");
+        let extracted_model_dir = cache_root.join("extracted").join("runtime-model");
+        let hf_model_dir = cache_root.join("hf").join("owner--repo");
+        let hf_hub_model_dir = cache_root.join("hf-hub").join("models--owner--repo");
+        std::fs::create_dir_all(&registry_model_dir).unwrap();
+        std::fs::create_dir_all(&extracted_model_dir).unwrap();
+        std::fs::create_dir_all(&hf_model_dir).unwrap();
+        std::fs::create_dir_all(&hf_hub_model_dir).unwrap();
+        std::fs::write(registry_model_dir.join("model.xyb"), b"bundle").unwrap();
+        std::fs::write(extracted_model_dir.join("model.gguf"), b"runtime").unwrap();
+        std::fs::write(hf_model_dir.join("model.gguf"), b"hf").unwrap();
+        std::fs::write(hf_hub_model_dir.join("blob"), b"hub").unwrap();
+
+        let mut client = RegistryClient::with_url("https://example.test").unwrap();
+        client.cache = CacheManager::with_dir(models_dir).unwrap();
+
+        let entries = client.cache_entries().unwrap();
+        let labels: Vec<_> = entries
+            .iter()
+            .map(|entry| (entry.model_id.as_str(), entry.location.as_str()))
+            .collect();
+
+        assert_eq!(entries.len(), 4);
+        assert!(labels.contains(&("registry-model", "models")));
+        assert!(labels.contains(&("runtime-model", "extracted")));
+        assert!(labels.contains(&("owner--repo", "hf")));
+        assert!(labels.contains(&("models--owner--repo", "hf-hub")));
+
+        let stats = client.cache_stats().unwrap();
+        assert_eq!(stats.model_count, 4);
+        assert_eq!(stats.total_size_bytes, 18);
+    }
+
+    #[test]
+    fn cache_entries_include_custom_root_and_legacy_parent_extracted_cache() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let custom_cache = temp_dir.path().join("custom-cache");
+        let registry_model_dir = custom_cache.join("registry-model");
+        let extracted_model_dir = custom_cache.join("extracted").join("runtime-model");
+        let legacy_extracted_model_dir = temp_dir.path().join("extracted").join("legacy-model");
+        let hf_model_dir = custom_cache.join("hf").join("owner--repo");
+        let hf_hub_model_dir = custom_cache.join("hf-hub").join("models--owner--repo");
+        std::fs::create_dir_all(&registry_model_dir).unwrap();
+        std::fs::create_dir_all(&extracted_model_dir).unwrap();
+        std::fs::create_dir_all(&legacy_extracted_model_dir).unwrap();
+        std::fs::create_dir_all(&hf_model_dir).unwrap();
+        std::fs::create_dir_all(&hf_hub_model_dir).unwrap();
+        std::fs::write(registry_model_dir.join("model.xyb"), b"bundle").unwrap();
+        std::fs::write(extracted_model_dir.join("model.gguf"), b"runtime").unwrap();
+        std::fs::write(legacy_extracted_model_dir.join("model.gguf"), b"legacy").unwrap();
+        std::fs::write(hf_model_dir.join("model.gguf"), b"hf").unwrap();
+        std::fs::write(hf_hub_model_dir.join("blob"), b"hub").unwrap();
+
+        let mut client = RegistryClient::with_url("https://example.test").unwrap();
+        client.cache = CacheManager::with_dir(custom_cache.clone()).unwrap();
+
+        let entries = client.cache_entries().unwrap();
+        let labels: Vec<_> = entries
+            .iter()
+            .map(|entry| (entry.model_id.as_str(), entry.location.as_str()))
+            .collect();
+
+        assert_eq!(entries.len(), 5);
+        assert!(labels.contains(&("registry-model", "models")));
+        assert!(labels.contains(&("runtime-model", "extracted")));
+        assert!(labels.contains(&("legacy-model", "extracted")));
+        assert!(labels.contains(&("owner--repo", "hf")));
+        assert!(labels.contains(&("models--owner--repo", "hf-hub")));
+        assert!(!labels.contains(&("extracted", "models")));
+        assert!(!labels.contains(&("hf", "models")));
+        assert!(!labels.contains(&("hf-hub", "models")));
+
+        let stats = client.cache_stats().unwrap();
+        assert_eq!(stats.model_count, 5);
+        assert_eq!(stats.cache_root(), custom_cache);
+        assert_eq!(stats.total_size_bytes, 24);
+    }
+
+    #[test]
+    fn clear_cache_removes_legacy_bundle_from_memory_index() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let cache_dir = temp_dir.path().join("models");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        std::fs::write(cache_dir.join("test-model@1.0.xyb"), b"bundle").unwrap();
+
+        let mut client = RegistryClient::with_url("https://example.test").unwrap();
+        client.cache = CacheManager::with_dir(cache_dir).unwrap();
+
+        let removed = client.clear_cache("test-model").unwrap();
+
+        assert_eq!(removed, 1);
+        assert_eq!(client.cache.status().unwrap().total_models, 0);
+        assert!(!client.cache.is_cached("test-model"));
+    }
+
+    #[test]
+    fn cache_stats_root_keeps_custom_non_models_cache_self_contained() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let cache_path = temp_dir.path().join("custom-cache");
+        let stats = CacheStats {
+            total_size_bytes: 0,
+            model_count: 0,
+            cache_path: cache_path.clone(),
+        };
+
+        assert_eq!(stats.cache_root(), cache_path);
     }
 
     #[test]
@@ -1510,6 +2077,82 @@ mod tests {
     }
 
     #[test]
+    fn retry_after_seconds_header_is_used_for_rate_limit_errors() {
+        let client = RegistryClient::default_client().unwrap();
+        let error = client.status_to_error(429, "list models", Some("120"));
+
+        assert!(matches!(
+            error,
+            SdkError::RateLimited {
+                retry_after_secs: 120
+            }
+        ));
+    }
+
+    #[test]
+    fn retry_after_header_is_read_from_ureq_error_response() {
+        use httpmock::prelude::*;
+
+        let server = MockServer::start();
+        let rate_limited = server.mock(|when, then| {
+            when.method(GET).path("/v1/models");
+            then.status(429).header("Retry-After", "120");
+        });
+
+        let client = RegistryClient::with_url(server.base_url()).unwrap();
+        let response = client
+            .agent
+            .get(&format!("{}/v1/models", server.base_url()))
+            .call();
+
+        assert!(matches!(
+            client.handle_response(response, "list models"),
+            Err(SdkError::RateLimited {
+                retry_after_secs: 120
+            })
+        ));
+        rate_limited.assert();
+    }
+
+    #[test]
+    fn retry_after_http_date_header_is_used_for_rate_limit_errors() {
+        let now = Utc.with_ymd_and_hms(2026, 10, 21, 7, 27, 0).unwrap();
+
+        assert_eq!(
+            rate_limit_retry_after_secs_at(Some("Wed, 21 Oct 2026 07:28:00 GMT"), now),
+            60
+        );
+    }
+
+    #[test]
+    fn retry_after_missing_or_malformed_header_uses_default_delay() {
+        let now = Utc.with_ymd_and_hms(2026, 10, 21, 7, 27, 0).unwrap();
+
+        assert_eq!(
+            rate_limit_retry_after_secs_at(None, now),
+            DEFAULT_RATE_LIMIT_RETRY_AFTER_SECS
+        );
+        assert_eq!(
+            rate_limit_retry_after_secs_at(Some("not a retry date"), now),
+            DEFAULT_RATE_LIMIT_RETRY_AFTER_SECS
+        );
+    }
+
+    #[test]
+    fn retry_after_header_is_capped() {
+        let now = Utc.with_ymd_and_hms(2026, 10, 21, 7, 27, 0).unwrap();
+
+        assert_eq!(
+            rate_limit_retry_after_secs_at(Some("1200"), now),
+            MAX_RATE_LIMIT_RETRY_AFTER_SECS
+        );
+        assert_eq!(
+            rate_limit_retry_after_secs_at(Some("Wed, 21 Oct 2026 07:37:00 GMT"), now),
+            MAX_RATE_LIMIT_RETRY_AFTER_SECS
+        );
+    }
+
+    #[test]
     fn test_cache_path() {
         let client = RegistryClient::default_client().unwrap();
         let resolved = ResolvedVariant {
@@ -1520,6 +2163,7 @@ mod tests {
             quantization: "fp16".to_string(),
             size_bytes: 100000,
             sha256: "abc123".to_string(),
+            artifacts: Vec::new(),
             passthrough: false,
             model_metadata: None,
         };
@@ -1593,12 +2237,12 @@ mod tests {
         assert!(circuit.is_closed(), "breaker starts closed");
 
         let mut op = |_url: &str| -> Result<ureq::Response, SdkError> {
-            Err(SdkError::Offline("simulated offline".to_string()))
+            Err(SdkError::offline("simulated offline"))
         };
 
         let result =
             client.execute_with_retry_for_url("https://primary.example.invalid", &circuit, &mut op);
-        assert!(matches!(result, Err(SdkError::Offline(_))));
+        assert!(matches!(result, Err(SdkError::Offline { .. })));
         assert_eq!(
             circuit.failure_count(),
             0,
@@ -1623,7 +2267,7 @@ mod tests {
 
         let mut op = |_url: &str| -> Result<ureq::Response, SdkError> {
             call_count.fetch_add(1, Ordering::SeqCst);
-            Err(SdkError::Offline("simulated offline".to_string()))
+            Err(SdkError::offline("simulated offline"))
         };
 
         let result =

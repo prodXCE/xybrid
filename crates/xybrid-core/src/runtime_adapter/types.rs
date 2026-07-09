@@ -11,7 +11,13 @@
 //! - `GenerationConfig` - Generation parameters for LLM inference
 //! - `LlmConfig` - Configuration for loading a local LLM
 
+use crate::gateway::Tool;
 use crate::ir::MessageRole;
+use crate::{
+    conversation::ConversationContext,
+    ir::{Envelope, EnvelopeKind, ImageDimensions, ImageFormat, ImageSource},
+    runtime_adapter::AdapterError,
+};
 use serde::{Deserialize, Serialize};
 
 // =============================================================================
@@ -119,6 +125,178 @@ impl ChatMessage {
 }
 
 // =============================================================================
+// Multimodal Chat Message
+// =============================================================================
+
+/// Image part carried through the backend-neutral multimodal chat contract.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MultimodalImagePart {
+    /// Image source. Debug and human-readable serialization redact bytes.
+    pub source: ImageSource,
+    /// Envelope-local ID for diagnostics and future cache keys.
+    pub local_id: String,
+}
+
+impl MultimodalImagePart {
+    /// Create an image part from an envelope image source.
+    pub fn new(source: ImageSource, local_id: impl Into<String>) -> Self {
+        Self {
+            source,
+            local_id: local_id.into(),
+        }
+    }
+
+    /// Encoded byte length for diagnostics and marker planning.
+    pub fn byte_len(&self) -> usize {
+        self.source.byte_len()
+    }
+
+    /// Encoded image format, when available.
+    pub fn format(&self) -> Option<ImageFormat> {
+        self.source.encoded_format()
+    }
+
+    /// Validated decoded dimensions, when available.
+    pub fn dimensions(&self) -> Option<ImageDimensions> {
+        self.source.dimensions()
+    }
+}
+
+/// Ordered part in a backend-neutral multimodal chat message.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum MultimodalMessagePart {
+    /// Text fragment.
+    Text(String),
+    /// Image fragment. The source may carry bytes, but diagnostics stay redacted.
+    Image(MultimodalImagePart),
+}
+
+impl MultimodalMessagePart {
+    /// Return the contained text if this is a text part.
+    pub fn as_text(&self) -> Option<&str> {
+        match self {
+            Self::Text(text) => Some(text),
+            Self::Image(_) => None,
+        }
+    }
+
+    /// Return true when this part is an image.
+    pub fn is_image(&self) -> bool {
+        matches!(self, Self::Image(_))
+    }
+}
+
+/// Backend-neutral multimodal message preserving ordered text and image parts.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MultimodalChatMessage {
+    /// Role of the message sender.
+    pub role: MessageRole,
+    /// Ordered message parts.
+    pub parts: Vec<MultimodalMessagePart>,
+}
+
+impl MultimodalChatMessage {
+    /// Build a multimodal message from a single envelope.
+    pub fn from_envelope(envelope: &Envelope) -> Result<Self, AdapterError> {
+        let role = envelope.role().unwrap_or(MessageRole::User);
+        let parts = parts_from_envelope(envelope)?;
+        if parts.is_empty() {
+            return Err(AdapterError::InvalidInput(
+                "multimodal message must contain at least one part".to_string(),
+            ));
+        }
+
+        Ok(Self { role, parts })
+    }
+
+    /// Build multimodal messages from a conversation context in replay order.
+    pub fn from_context(context: &ConversationContext) -> Result<Vec<Self>, AdapterError> {
+        context
+            .context_for_llm()
+            .into_iter()
+            .map(Self::from_envelope)
+            .collect()
+    }
+
+    /// Count image parts.
+    pub fn image_count(&self) -> usize {
+        self.parts.iter().filter(|part| part.is_image()).count()
+    }
+
+    /// Convert ordered parts to a marker prompt for backends such as llama.cpp mtmd.
+    ///
+    /// Text fragments must not already contain the reserved marker because that
+    /// would make marker/image-count parity ambiguous at the backend boundary.
+    pub fn marker_prompt(&self, marker: &str) -> Result<String, AdapterError> {
+        if marker.is_empty() {
+            return Err(AdapterError::InvalidInput(
+                "media marker must not be empty".to_string(),
+            ));
+        }
+
+        let mut prompt = String::new();
+        for part in &self.parts {
+            match part {
+                MultimodalMessagePart::Text(text) => {
+                    if text.contains(marker) {
+                        return Err(AdapterError::InvalidInput(
+                            "text part contains reserved media marker; marker/image-count parity would be ambiguous".to_string(),
+                        ));
+                    }
+                    prompt.push_str(text);
+                }
+                MultimodalMessagePart::Image(_) => prompt.push_str(marker),
+            }
+        }
+
+        let marker_count = prompt.matches(marker).count();
+        let image_count = self.image_count();
+        if marker_count != image_count {
+            return Err(AdapterError::InvalidInput(format!(
+                "media marker count {} does not match image count {}",
+                marker_count, image_count
+            )));
+        }
+
+        Ok(prompt)
+    }
+}
+
+fn parts_from_envelope(envelope: &Envelope) -> Result<Vec<MultimodalMessagePart>, AdapterError> {
+    match &envelope.kind {
+        EnvelopeKind::Text(text) => Ok(vec![MultimodalMessagePart::Text(text.clone())]),
+        EnvelopeKind::Image { source } => Ok(vec![MultimodalMessagePart::Image(
+            MultimodalImagePart::new(source.clone(), envelope.local_id().to_string()),
+        )]),
+        EnvelopeKind::MultiPart(parts) => parts
+            .iter()
+            .map(part_from_multipart_fragment)
+            .collect::<Result<Vec<_>, _>>(),
+        EnvelopeKind::Audio(_) | EnvelopeKind::Embedding(_) => {
+            Err(AdapterError::InvalidInput(format!(
+                "unsupported multimodal envelope kind {}",
+                envelope.kind.as_str()
+            )))
+        }
+    }
+}
+
+fn part_from_multipart_fragment(
+    envelope: &Envelope,
+) -> Result<MultimodalMessagePart, AdapterError> {
+    match &envelope.kind {
+        EnvelopeKind::Text(text) => Ok(MultimodalMessagePart::Text(text.clone())),
+        EnvelopeKind::Image { source } => Ok(MultimodalMessagePart::Image(
+            MultimodalImagePart::new(source.clone(), envelope.local_id().to_string()),
+        )),
+        other => Err(AdapterError::InvalidInput(format!(
+            "unsupported multimodal part kind {}",
+            other.as_str()
+        ))),
+    }
+}
+
+// =============================================================================
 // Generation Configuration
 // =============================================================================
 
@@ -159,6 +337,30 @@ pub struct GenerationConfig {
     /// Stop sequences.
     #[serde(default)]
     pub stop_sequences: Vec<String>,
+
+    /// Optional GBNF grammar constraining generation. When set, the local
+    /// llama.cpp backend masks any token the grammar would reject, guaranteeing
+    /// structured output (e.g. schema-valid JSON for data extraction).
+    ///
+    /// Set the raw grammar via [`GenerationConfig::with_grammar`], or convert a
+    /// JSON Schema with [`GenerationConfig::with_json_schema`]. `None` = free
+    /// (unconstrained) generation. Ignored by non-llama backends.
+    #[serde(default)]
+    pub grammar: Option<String>,
+
+    /// Tools (functions) the model may call, in the OpenAI `Tool` shape.
+    ///
+    /// When non-empty, the local llama.cpp backend renders the definitions
+    /// into the model's embedded chat template and the executor parses any
+    /// emitted tool-call blocks (LFM2-family pythonic and gemma-4-family
+    /// `call:` notation) into the response envelope's `tool_calls` metadata.
+    /// Tool calling is llama.cpp-only today and unsupported paths fail
+    /// closed: a model without an embedded chat template, the mistralrs
+    /// backend, and the SDK's cloud-fallback leg all reject tool-bearing
+    /// requests instead of silently generating without the tools. Empty
+    /// means no tool calling (existing behavior, unchanged).
+    #[serde(default)]
+    pub tools: Vec<Tool>,
 }
 
 fn default_max_tokens() -> usize {
@@ -199,6 +401,8 @@ impl Default for GenerationConfig {
             top_k: default_top_k(),
             repetition_penalty: default_repetition_penalty(),
             stop_sequences: Vec::new(),
+            grammar: None,
+            tools: Vec::new(),
         }
     }
 }
@@ -241,6 +445,70 @@ impl GenerationConfig {
         self.stop_sequences.push(stop.into());
         self
     }
+
+    /// Constrain generation to a raw [GBNF] grammar (entry rule `root`).
+    ///
+    /// This is the escape hatch for callers who already have a grammar; most
+    /// callers should use [`GenerationConfig::with_json_schema`] instead. Only
+    /// the local llama.cpp backend honors this; other backends ignore it.
+    ///
+    /// [GBNF]: https://github.com/ggml-org/llama.cpp/blob/master/grammars/README.md
+    pub fn with_grammar(mut self, grammar: impl Into<String>) -> Self {
+        self.grammar = Some(grammar.into());
+        self
+    }
+
+    /// Constrain generation to a JSON Schema, converting it to a GBNF grammar.
+    ///
+    /// Guarantees the model emits schema-valid JSON — the basis for reliable
+    /// on-device data extraction. Supports a subset of JSON Schema (objects,
+    /// arrays, scalars, enums); see [`crate::runtime_adapter::grammar`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`XybridError::Grammar`] if the schema is malformed or uses an
+    /// unsupported construct.
+    ///
+    /// [`XybridError::Grammar`]: crate::error::XybridError::Grammar
+    pub fn with_json_schema(
+        mut self,
+        schema: &serde_json::Value,
+    ) -> crate::error::XybridResult<Self> {
+        self.grammar = Some(crate::runtime_adapter::grammar::json_schema_to_gbnf(
+            schema,
+        )?);
+        Ok(self)
+    }
+
+    /// Offer tools (functions) the model may call. See [`GenerationConfig::tools`].
+    ///
+    /// Tools are plain data — define your own with [`Tool::function`], run
+    /// the request, execute whatever calls come back in the response
+    /// envelope's `tool_calls` metadata, and feed the results into the next
+    /// turn with `Envelope::tool_results`. The multi-turn loop lives in app
+    /// code.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use xybrid_core::gateway::Tool;
+    /// use xybrid_core::runtime_adapter::types::GenerationConfig;
+    ///
+    /// let config = GenerationConfig::default().with_tools([Tool::function(
+    ///     "get_weather",
+    ///     "Current weather for a city.",
+    ///     serde_json::json!({
+    ///         "type": "object",
+    ///         "properties": { "city": { "type": "string" } },
+    ///         "required": ["city"]
+    ///     }),
+    /// )]);
+    /// assert_eq!(config.tools.len(), 1);
+    /// ```
+    pub fn with_tools(mut self, tools: impl IntoIterator<Item = Tool>) -> Self {
+        self.tools = tools.into_iter().collect();
+        self
+    }
 }
 
 // =============================================================================
@@ -255,6 +523,14 @@ pub struct LlmConfig {
 
     /// Path to chat template file (optional).
     pub chat_template: Option<String>,
+
+    /// Path to sibling vision encoder / mmproj artifact (optional).
+    ///
+    /// Embedding-style backends may load a separate vision encoder from this
+    /// path. llama.cpp VLMs use it as the mmproj artifact for their backend-owned
+    /// mtmd chunk/eval path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vision_encoder_path: Option<String>,
 
     /// Maximum context length (tokens). Default: 4096
     #[serde(default = "default_context_length")]
@@ -291,6 +567,14 @@ pub struct LlmConfig {
     /// Can provide 2-4x speedup. Default: true.
     #[serde(default = "default_flash_attn")]
     pub flash_attn: bool,
+
+    /// Whether this is a reasoning ("thinking") model that emits a
+    /// chain-of-thought before its answer. Sourced from the model metadata's
+    /// `reasoning` flag. When set, the chat-prompt builder primes the
+    /// `<think>` channel so the model produces its reasoning, which the backend
+    /// captures into `reasoning_content`. Default: false.
+    #[serde(default)]
+    pub reasoning: bool,
 }
 
 fn default_context_length() -> usize {
@@ -348,6 +632,7 @@ impl Default for LlmConfig {
         Self {
             model_path: String::new(),
             chat_template: None,
+            vision_encoder_path: None,
             context_length: default_context_length(),
             gpu_layers: default_gpu_layers(),
             paged_attention: default_paged_attention(),
@@ -355,6 +640,7 @@ impl Default for LlmConfig {
             n_threads: default_n_threads(),
             n_batch: default_n_batch(),
             flash_attn: default_flash_attn(),
+            reasoning: false,
         }
     }
 }
@@ -374,9 +660,22 @@ impl LlmConfig {
         self
     }
 
+    /// Set the sibling vision encoder / mmproj artifact path.
+    pub fn with_vision_encoder(mut self, path: impl Into<String>) -> Self {
+        self.vision_encoder_path = Some(path.into());
+        self
+    }
+
     /// Set the context length.
     pub fn with_context_length(mut self, length: usize) -> Self {
         self.context_length = length;
+        self
+    }
+
+    /// Mark this as a reasoning ("thinking") model. Primes the `<think>`
+    /// channel during chat-prompt construction. See [`Self::reasoning`].
+    pub fn with_reasoning(mut self, reasoning: bool) -> Self {
+        self.reasoning = reasoning;
         self
     }
 
@@ -417,7 +716,20 @@ impl LlmConfig {
 
 #[cfg(test)]
 mod tests {
+    use crate::gateway::{FunctionDefinition, Tool};
+
     use super::*;
+
+    fn test_tool() -> Tool {
+        Tool {
+            tool_type: "function".into(),
+            function: FunctionDefinition {
+                name: "f".into(),
+                description: None,
+                parameters: None,
+            },
+        }
+    }
 
     #[test]
     fn test_partial_token_new() {
@@ -514,6 +826,42 @@ mod tests {
     }
 
     #[test]
+    fn test_generation_config_default_has_empty_tools() {
+        let config = GenerationConfig::default();
+
+        assert!(config.tools.is_empty());
+    }
+
+    #[test]
+    fn test_generation_config_with_tools_sets_tools() {
+        let config = GenerationConfig::default().with_tools([test_tool()]);
+
+        assert_eq!(config.tools.len(), 1);
+        assert_eq!(config.tools[0].tool_type, "function");
+        assert_eq!(config.tools[0].function.name, "f");
+    }
+
+    #[test]
+    fn test_generation_config_deserializes_legacy_json_with_empty_tools() {
+        let config: GenerationConfig = serde_json::from_str(r#"{"max_tokens":128}"#).unwrap();
+
+        assert_eq!(config.max_tokens, 128);
+        assert!(config.tools.is_empty());
+    }
+
+    #[test]
+    fn test_generation_config_tools_serde_round_trip() {
+        let config = GenerationConfig::default().with_tools([test_tool()]);
+
+        let json = serde_json::to_string(&config).unwrap();
+        let parsed: GenerationConfig = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed.tools.len(), 1);
+        assert_eq!(parsed.tools[0].tool_type, "function");
+        assert_eq!(parsed.tools[0].function.name, "f");
+    }
+
+    #[test]
     fn test_generation_config_with_max_tokens() {
         let config = GenerationConfig::default().with_max_tokens(1024);
         assert_eq!(config.max_tokens, 1024);
@@ -550,6 +898,16 @@ mod tests {
     fn test_llm_config_with_chat_template() {
         let config = LlmConfig::new("/path/to/model.gguf").with_chat_template("chatml".to_string());
         assert_eq!(config.chat_template, Some("chatml".to_string()));
+    }
+
+    #[test]
+    fn test_llm_config_with_vision_encoder_path() {
+        let config =
+            LlmConfig::new("/path/to/model.gguf").with_vision_encoder("/path/to/mmproj.gguf");
+        assert_eq!(
+            config.vision_encoder_path.as_deref(),
+            Some("/path/to/mmproj.gguf")
+        );
     }
 
     #[test]

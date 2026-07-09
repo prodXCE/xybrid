@@ -16,7 +16,10 @@
 //!
 //! # Example
 //!
-//! ```rust,ignore
+//! ```no_run
+//! # fn _example() -> Result<(), Box<dyn std::error::Error>> {
+//! use std::collections::HashMap;
+//! use ndarray::ArrayD;
 //! use xybrid_core::runtime_adapter::onnx::{ONNXSession, ExecutionProviderKind, SessionOptions};
 //!
 //! // CPU execution, no profiling overhead
@@ -26,16 +29,13 @@
 //!     SessionOptions::default(),
 //! )?;
 //!
-//! // CoreML execution with resolved-EP capture (requires ort-coreml feature)
-//! #[cfg(feature = "ort-coreml")]
-//! let session = ONNXSession::build(
-//!     "/path/to/model.onnx",
-//!     ExecutionProviderKind::CoreML(CoreMLConfig::with_neural_engine()),
-//!     SessionOptions { capture_resolved_ep: true },
-//! )?;
+//! // CoreML execution with resolved-EP capture is gated by the `ort-coreml` cfg.
 //!
-//! let inputs = /* prepare inputs */;
+//! let inputs: HashMap<String, ArrayD<f32>> = HashMap::new();
 //! let outputs = session.run(inputs)?;
+//! # let _ = outputs;
+//! # Ok(())
+//! # }
 //! ```
 
 use super::execution_provider::ExecutionProviderKind;
@@ -165,7 +165,8 @@ impl ONNXSession {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
+    /// ```no_run
+    /// # fn _example() -> Result<(), Box<dyn std::error::Error>> {
     /// use xybrid_core::runtime_adapter::onnx::{ONNXSession, ExecutionProviderKind, SessionOptions};
     ///
     /// // Cheap path — no profiling overhead, no tempdir
@@ -176,11 +177,16 @@ impl ONNXSession {
     /// )?;
     ///
     /// // Opt in to resolved-EP capture for telemetry callers
+    /// let mut opts = SessionOptions::default();
+    /// opts.capture_resolved_ep = true;
     /// let session = ONNXSession::build(
     ///     "model.onnx",
     ///     ExecutionProviderKind::Cpu,
-    ///     SessionOptions { capture_resolved_ep: true },
+    ///     opts,
     /// )?;
+    /// # let _ = session;
+    /// # Ok(())
+    /// # }
     /// ```
     pub fn build(
         model_path: &str,
@@ -459,25 +465,27 @@ impl ONNXSession {
             // Try to extract as f32 first, then as i64 if that fails
             // This handles models with mixed output types
             let array_d = if let Ok(output_array) = output_value.try_extract_array::<f32>() {
-                // Convert ndarray view to owned ArrayD
-                let shape = output_array.shape();
-                let dims: Vec<usize> = shape.to_vec();
-                let owned_array = output_array.to_owned();
-                let data: Vec<f32> = owned_array.as_slice().unwrap().to_vec();
+                // Fast path: a standard-layout output is one contiguous slice
+                // (a memcpy). Fall back to logical-order iteration only when the
+                // output is non-contiguous (e.g. transposed) — which `as_slice`
+                // reports as `None`, where the old `as_slice().unwrap()` panicked.
+                // Either way the data is row-major, matching `from_shape_vec`.
+                let dims: Vec<usize> = output_array.shape().to_vec();
+                let data: Vec<f32> = match output_array.as_slice() {
+                    Some(slice) => slice.to_vec(),
+                    None => output_array.iter().copied().collect(),
+                };
                 ArrayD::from_shape_vec(IxDyn(&dims), data).map_err(|e| {
                     AdapterError::RuntimeError(format!("Failed to convert output to ArrayD: {}", e))
                 })?
             } else if let Ok(output_array) = output_value.try_extract_array::<i64>() {
-                // Convert i64 to f32 for uniform handling
-                let shape = output_array.shape();
-                let dims: Vec<usize> = shape.to_vec();
-                let owned_array = output_array.to_owned();
-                let data: Vec<f32> = owned_array
-                    .as_slice()
-                    .unwrap()
-                    .iter()
-                    .map(|&x| x as f32)
-                    .collect();
+                // Convert i64 to f32 for uniform handling, same fast/safe split
+                // as the f32 arm above.
+                let dims: Vec<usize> = output_array.shape().to_vec();
+                let data: Vec<f32> = match output_array.as_slice() {
+                    Some(slice) => slice.iter().map(|&x| x as f32).collect(),
+                    None => output_array.iter().map(|&x| x as f32).collect(),
+                };
                 ArrayD::from_shape_vec(IxDyn(&dims), data).map_err(|e| {
                     AdapterError::RuntimeError(format!("Failed to convert output to ArrayD: {}", e))
                 })?
@@ -636,6 +644,14 @@ mod tests {
 
     #[test]
     fn test_session_creation_with_mock_file() {
+        // The mock file passes the existence check, so this reaches real ort
+        // initialization — under load-dynamic a missing libonnxruntime panics
+        // inside ort, so skip on runners without the binary.
+        if !crate::runtime_adapter::onnx::ort_runtime_available() {
+            eprintln!("skipping: onnxruntime dylib not available in this environment");
+            return;
+        }
+
         // Create a temporary ONNX file (minimal valid ONNX format)
         // Note: This is a minimal test - real ONNX files are binary protobuf
         // For now, we'll test that the file existence check works

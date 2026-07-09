@@ -35,6 +35,7 @@
 [![License][license-shield]][license-url]
 [![Build][build-shield]][build-url]
 [![OpenSSF Scorecard][scorecard-shield]][scorecard-url]
+[![OpenSSF Best Practices][bestpractices-shield]][bestpractices-url]
 [![Stars][stars-shield]][stars-url]
 [![Release][release-shield]][release-url]
 [![Release Date][release-date-shield]][release-url]
@@ -61,6 +62,8 @@
 [build-url]: https://github.com/xybrid-ai/xybrid/actions
 [scorecard-shield]: https://api.scorecard.dev/projects/github.com/xybrid-ai/xybrid/badge
 [scorecard-url]: https://scorecard.dev/viewer/?uri=github.com/xybrid-ai/xybrid
+[bestpractices-shield]: https://www.bestpractices.dev/projects/13041/badge
+[bestpractices-url]: https://www.bestpractices.dev/projects/13041
 [stars-shield]: https://img.shields.io/github/stars/xybrid-ai/xybrid?style=flat
 [stars-url]: https://github.com/xybrid-ai/xybrid/stargazers
 [release-shield]: https://img.shields.io/github/v/release/xybrid-ai/xybrid?style=flat&sort=semver
@@ -127,7 +130,7 @@ See the full [Installation Guide](https://docs.xybrid.dev/en/docs/quickstart) fo
 
 ```yaml
 dependencies:
-  xybrid_flutter: ^0.1.0-rc3
+  xybrid_flutter: ^0.3.0
 ```
 
 **Run a model:**
@@ -144,7 +147,7 @@ final result = await model.run(XybridEnvelope.text('Hello world'));
 
 ```gradle
 dependencies {
-    implementation("ai.xybrid:xybrid-kotlin:0.1.0-rc3")
+    implementation("ai.xybrid:xybrid-kotlin:0.3.0")
 }
 ```
 
@@ -162,11 +165,9 @@ val result = model.run(Envelope.text("Hello world"))
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/xybrid-ai/xybrid.git", exact: "0.1.0-rc3")
+    .package(url: "https://github.com/xybrid-ai/xybrid.git", from: "0.3.0")
 ]
 ```
-
-> Once `0.1.0` ships, you'll be able to use `from: "0.1.0"`.
 
 **Run a model:**
 
@@ -178,11 +179,16 @@ let result = try model.run(envelope: Envelope.text("Hello world"))
 
 ### Unity
 
-**Install** via Unity Package Manager:
+**Install** via [OpenUPM](https://openupm.com/packages/ai.xybrid.sdk/) —
+`openupm add ai.xybrid.sdk`, or add the `https://package.openupm.com` scoped
+registry for scope `ai.xybrid` — or straight from the git subfolder:
 
 ```sh
-https://github.com/xybrid-ai/xybrid.git#upm
+https://github.com/xybrid-ai/xybrid.git?path=/bindings/unity
 ```
+
+Native libraries download automatically on import. See the
+[Unity SDK README](bindings/unity/README.md) for details.
 
 **Run a model:**
 
@@ -198,7 +204,7 @@ var result = model.Run(Envelope.Text("Hello world"));
 
 ```toml
 [dependencies]
-xybrid = "0.1.0-rc3"
+xybrid = "0.3.0"
 ```
 
 **Run a model:**
@@ -313,12 +319,20 @@ All models run entirely on-device. No cloud, no API keys required. Browse the fu
 | Model | Params | Format | Description |
 |-------|--------|--------|-------------|
 | Gemma 3 1B | 1B | GGUF Q4_K_M | Google's mobile-optimized LLM |
+| LFM2.5 230M | 230M | GGUF Q4_K_M | Liquid AI's smallest hybrid conv+attention LLM for edge devices |
 | LFM2.5 350M | 354M | GGUF Q4_K_M | Liquid AI's hybrid conv+attention, 9 languages, tool calling |
+| LFM2.5 1.2B Thinking | 1.2B | GGUF Q4_K_M | Liquid AI reasoning model — chain-of-thought via `reasoningContent` ([guide](https://docs.xybrid.dev/en/docs/guides/reasoning)) |
 | Llama 3.2 1B | 1B | GGUF Q4_K_M | Meta's general purpose, 128K context |
 | Qwen 2.5 0.5B | 500M | GGUF Q4_K_M | Compact on-device chat |
 | Qwen 3.5 0.8B | 800M | GGUF Q4_K_M | Latest Qwen with reasoning (thinking mode) |
 | Qwen 3.5 2B | 2B | GGUF Q4_K_M | Larger Qwen 3.5 with extended reasoning |
 | SmolLM2 360M | 360M | GGUF Q4_K_M | Best tiny LLM, excellent quality/size ratio |
+
+### Vision-Language
+
+| Model | Params | Format | Description |
+|-------|--------|--------|-------------|
+| LFM2-VL 450M | 450M | GGUF Q4_0 + mmproj | Liquid AI's compact VLM (SigLIP2 vision) — image + text in, runs via llama.cpp mtmd |
 
 ### Coming Soon
 
@@ -329,7 +343,6 @@ All models run entirely on-device. No cloud, no API keys required. Browse the fu
 | Trinity Nano | LLM (MoE) | 6B (1B active) | P2 | Planned |
 | LFM2-VL 700M | Vision+LLM | 700M | P2 | Planned |
 | Nomic Embed Text v1.5 | Embeddings | 137M | P1 | Blocked (needs Tokenize/MeanPool steps) |
-| LFM2-VL 450M | Vision | 450M | P2 | Planned |
 | Whisper Tiny CoreML | ASR | 39M | P2 | Planned |
 | Qwen3-TTS 0.6B | TTS | 600M | P2 | Blocked (needs custom SafeTensors runtime) |
 | Chatterbox Turbo | TTS | 350M | P3 | Blocked (needs ModelGraph template) |
@@ -380,13 +393,21 @@ See the [model metadata docs](docs/sdk/API_REFERENCE.md) for the full schema, or
 | Speech-to-Text | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Text-to-Speech | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Language Models | ✅ | ✅ | ✅ | ✅ | ✅ |
-| Vision Models | 🔜 | 🔜 | 🔜 | 🔜 | 🔜 |
+| Vision Models | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Tool Calling | 🔜 | 🔜 | ✅ | ✅ | ✅ |
 | Embeddings | 🔜 | 🔜 | 🔜 | 🔜 | 🔜 |
 | Multi-Model Pipelines (MMP) | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Model Download & Caching | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Hardware Acceleration | Metal, ANE | CPU | Metal, ANE | CUDA | CUDA |
 
 **SDK MMP support:** Flutter ✅ · Rust ✅ · Kotlin 🔜 · Swift 🔜 · Unity 🔜
+
+**Tool calling:** local models call functions you define — your tools are
+plain data (`Tool::function(...)`) and the loop is your code, so any tooling
+plugs in. On-device via llama.cpp (LFM2 and gemma-4 protocols); Rust SDK and
+CLI today (`xybrid repl` ships built-in `web_search` + your own via
+`--tools-file`), Swift/Kotlin/Flutter bindings next. See the
+[Tool Calling guide](https://docs.xybrid.dev/en/docs/guides/tool-calling).
 
 ---
 

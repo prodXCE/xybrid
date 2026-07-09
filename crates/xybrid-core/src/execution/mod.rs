@@ -41,15 +41,21 @@
 //!
 //! ## Usage
 //!
-//! ```rust,ignore
+//! ```no_run
+//! # fn _example() -> Result<(), Box<dyn std::error::Error>> {
 //! use xybrid_core::execution::{TemplateExecutor, template::ModelMetadata};
 //! use xybrid_core::ir::{Envelope, EnvelopeKind};
 //!
-//! let metadata: ModelMetadata = serde_json::from_str(&config_json)?;
+//! # let config_json = "{}";
+//! # let audio_bytes: Vec<u8> = vec![];
+//! let metadata: ModelMetadata = serde_json::from_str(config_json)?;
 //! let mut executor = TemplateExecutor::with_base_path("/path/to/model-dir");
 //!
 //! let input = Envelope::new(EnvelopeKind::Audio(audio_bytes));
-//! let output = executor.execute(&metadata, &input)?;
+//! let output = executor.execute(&metadata, &input, None)?;
+//! # let _ = output;
+//! # Ok(())
+//! # }
 //! ```
 
 // Template types (model_metadata.json schema)
@@ -61,9 +67,11 @@ pub use chat_template::{ChatTemplateFormat, ChatTemplateFormatter};
 
 // Re-export commonly used template types at execution:: level
 pub use template::{
-    ExecutionMode, ExecutionTemplate, ModelMetadata, PipelineStage, PostprocessingStep,
-    PreprocessingStep, VoiceConfig, VoiceFormat, VoiceInfo, VoiceLoader,
+    ExecutionMode, ExecutionTemplate, ImageNormalizePreset, ImageResizeMode, ImageTensorLayout,
+    ModelMetadata, PipelineStage, PostprocessingStep, PreprocessingStep, VoiceConfig, VoiceFormat,
+    VoiceInfo, VoiceLoader,
 };
+pub use template::{VisionEncoderConfig, VisionPreprocessingPreset};
 
 // Data types (internal)
 pub(crate) mod types;
@@ -80,12 +88,30 @@ pub(crate) mod session_factory;
 #[allow(unused_imports)]
 pub(crate) use session_factory::{InferenceSession, OnnxSessionFactory, SessionFactory};
 
+// Base-path file resolution (internal)
+pub(crate) mod path;
+
+// TTS text chunking (internal)
+pub(crate) mod text_chunking;
+
+// LLM telemetry span stampers (internal, LLM features only)
+#[cfg(any(feature = "llm-mistral", feature = "llm-llamacpp"))]
+pub(crate) mod llm_telemetry;
+
+// Tool-result continuation glue for the executor's LLM paths (internal,
+// LLM features only)
+#[cfg(any(feature = "llm-mistral", feature = "llm-llamacpp"))]
+pub(crate) mod tool_continuation;
+
 // Main executor
 mod executor;
 pub use executor::TemplateExecutor;
 
 // Preprocessing steps (internal implementation details)
 pub(crate) mod preprocessing;
+
+#[cfg(any(test, feature = "dev-tools"))]
+pub mod test_seams;
 
 // Postprocessing steps (internal implementation details)
 pub(crate) mod postprocessing;

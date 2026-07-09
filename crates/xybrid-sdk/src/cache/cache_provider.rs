@@ -5,16 +5,21 @@
 //!
 //! ## Usage
 //!
-//! ```rust,ignore
+//! ```no_run
+//! # fn _example() -> Result<(), Box<dyn std::error::Error>> {
 //! use xybrid_sdk::SdkCacheProvider;
-//! use xybrid_core::orchestrator::LocalAuthority;
+//! use xybrid_sdk::orchestrator::LocalAuthority;
+//! use std::path::PathBuf;
 //! use std::sync::Arc;
 //!
 //! // Create SDK cache provider
-//! let provider = Arc::new(SdkCacheProvider::new()?);
+//! let provider = Arc::new(SdkCacheProvider::with_dir(PathBuf::from("/tmp/cache"))?);
 //!
 //! // Inject into LocalAuthority
 //! let authority = LocalAuthority::with_cache_provider(provider);
+//! # let _ = authority;
+//! # Ok(())
+//! # }
 //! ```
 
 use std::path::{Path, PathBuf};
@@ -34,17 +39,20 @@ use crate::model::SdkError;
 ///
 /// - Fuzzy model ID matching (e.g., "kokoro-82m" matches "Kokoro-82M-v1.0-ONNX")
 /// - Integrates with `CacheManager` for bundle management
-/// - Optionally uses `RegistryClient` for online resolution (when available)
 ///
 /// ## Example
 ///
-/// ```rust,ignore
-/// use xybrid_sdk::SdkCacheProvider;
+/// ```no_run
+/// # fn _example() -> Result<(), Box<dyn std::error::Error>> {
+/// use xybrid_sdk::{CacheProvider, SdkCacheProvider};
+/// use std::path::PathBuf;
 ///
-/// let provider = SdkCacheProvider::new()?;
+/// let provider = SdkCacheProvider::with_dir(PathBuf::from("/tmp/cache"))?;
 /// if provider.is_model_cached("kokoro-82m") {
 ///     println!("Model is available locally");
 /// }
+/// # Ok(())
+/// # }
 /// ```
 pub struct SdkCacheProvider {
     cache: CacheManager,
@@ -120,7 +128,15 @@ impl SdkCacheProvider {
             }
         }
 
-        // Also check integration-tests fixtures for development
+        // Development/test-only fallback: also look in the workspace's
+        // integration-tests fixtures so dev runs find locally-staged models.
+        // Gated behind the `test-util` feature (off by default) so shipped
+        // SDKs never reference `xybrid_core::testing` — `models_dir()` resolves
+        // via `CARGO_MANIFEST_DIR` / the fixtures tree, neither of which exists
+        // in a released binary, so it is a no-op in production anyway. Using a
+        // feature (not `debug_assertions`) keeps this consistent with core
+        // once `testing` is itself gated behind `xybrid-core/test-util`.
+        #[cfg(feature = "test-util")]
         if let Some(fixtures_dir) = xybrid_core::testing::model_fixtures::models_dir() {
             let fixtures_path = fixtures_dir.join(model_id);
             if fixtures_path.exists() && has_model_files(&fixtures_path) {

@@ -188,6 +188,10 @@ enum Commands {
         #[arg(long, value_name = "TEXT")]
         input_text: Option<String>,
 
+        /// Path to an input image for vision-language models (repeatable)
+        #[arg(long = "input-image", value_name = "FILE")]
+        input_images: Vec<PathBuf>,
+
         /// Voice ID for TTS models (e.g., "af_bella", "am_adam")
         #[arg(long, value_name = "VOICE")]
         voice: Option<String>,
@@ -204,6 +208,11 @@ enum Commands {
         /// Enable detailed execution tracing with flame graph output
         #[arg(long, default_value = "false")]
         trace: bool,
+
+        /// Print the model's chain-of-thought reasoning (`<think>` blocks),
+        /// which is stripped out of the answer text by default
+        #[arg(long, default_value = "false")]
+        show_reasoning: bool,
 
         /// Export trace to JSON file (Chrome trace format)
         #[arg(long, value_name = "FILE")]
@@ -232,7 +241,7 @@ enum Commands {
         #[arg(long, value_name = "VOICE")]
         voice: Option<String>,
 
-        /// Target format for model resolution (onnx, coreml, tflite)
+        /// Execution target for REPL inference (auto, local/device, cloud, server)
         #[arg(long, value_name = "TARGET")]
         target: Option<String>,
 
@@ -240,9 +249,25 @@ enum Commands {
         #[arg(long)]
         stream: bool,
 
+        /// Print the model's chain-of-thought reasoning (`<think>` blocks),
+        /// which is stripped out of the answer text by default
+        #[arg(long, default_value = "false")]
+        show_reasoning: bool,
+
         /// System prompt to set the assistant's behavior
         #[arg(long, value_name = "PROMPT")]
         system: Option<String>,
+
+        /// Disable built-in tool calling (web_search, fetch_url, current_time),
+        /// which is otherwise on for models whose metadata declares support
+        #[arg(long)]
+        no_tools: bool,
+
+        /// Add user-defined tools from a JSON or YAML file. Each entry maps a
+        /// JSON-schema'd function to a command; the model's arguments arrive
+        /// as JSON on the command's stdin, its stdout is the tool result
+        #[arg(long, value_name = "FILE")]
+        tools_file: Option<PathBuf>,
     },
     /// Trace and analyze telemetry logs from a session
     Trace {
@@ -265,7 +290,10 @@ enum Commands {
         name: String,
 
         /// Version string (e.g., 1.0.0)
-        #[arg(short, long, value_name = "VERSION", default_value = "0.1.0")]
+        ///
+        /// Long-only: `-v` belongs to the global `--verbose` flag, and clap
+        /// panics at startup on the collision.
+        #[arg(long, value_name = "VERSION", default_value = "0.1.0")]
         version: String,
 
         /// Target format (onnx, coreml, tflite, generic)
@@ -349,8 +377,8 @@ fn find_model_not_found(err: &anyhow::Error) -> Option<&str> {
 /// local unreachability issue rather than a registry-side problem.
 fn find_offline_error(err: &anyhow::Error) -> Option<&str> {
     for cause in err.chain() {
-        if let Some(SdkError::Offline(msg)) = cause.downcast_ref::<SdkError>() {
-            return Some(msg.as_str());
+        if let Some(SdkError::Offline { message, .. }) = cause.downcast_ref::<SdkError>() {
+            return Some(message.as_str());
         }
     }
     None
@@ -483,10 +511,12 @@ fn run_command(cli: Cli) -> Result<()> {
             policy,
             input_audio,
             input_text,
+            input_images,
             voice,
             output,
             target,
             trace,
+            show_reasoning,
             trace_export,
         } => {
             if trace {
@@ -498,10 +528,12 @@ fn run_command(cli: Cli) -> Result<()> {
                     &gguf_path,
                     input_audio.as_ref(),
                     input_text.as_deref(),
+                    &input_images,
                     voice.as_deref(),
                     output.as_ref(),
                     dry_run,
                     trace,
+                    show_reasoning,
                     trace_export.as_ref(),
                 );
             }
@@ -511,11 +543,13 @@ fn run_command(cli: Cli) -> Result<()> {
                     &model_id,
                     input_audio.as_ref(),
                     input_text.as_deref(),
+                    &input_images,
                     voice.as_deref(),
                     output.as_ref(),
                     target.as_deref(),
                     dry_run,
                     trace,
+                    show_reasoning,
                     trace_export.as_ref(),
                 );
             }
@@ -525,10 +559,12 @@ fn run_command(cli: Cli) -> Result<()> {
                     &dir,
                     input_audio.as_ref(),
                     input_text.as_deref(),
+                    &input_images,
                     voice.as_deref(),
                     output.as_ref(),
                     dry_run,
                     trace,
+                    show_reasoning,
                     trace_export.as_ref(),
                 );
             }
@@ -538,10 +574,12 @@ fn run_command(cli: Cli) -> Result<()> {
                     &repo,
                     input_audio.as_ref(),
                     input_text.as_deref(),
+                    &input_images,
                     voice.as_deref(),
                     output.as_ref(),
                     dry_run,
                     trace,
+                    show_reasoning,
                     trace_export.as_ref(),
                 );
             }
@@ -551,10 +589,12 @@ fn run_command(cli: Cli) -> Result<()> {
                     &bundle_path,
                     input_audio.as_ref(),
                     input_text.as_deref(),
+                    &input_images,
                     voice.as_deref(),
                     output.as_ref(),
                     dry_run,
                     trace,
+                    show_reasoning,
                     trace_export.as_ref(),
                 );
             }
@@ -566,10 +606,12 @@ fn run_command(cli: Cli) -> Result<()> {
                 policy.as_ref(),
                 input_audio.as_ref(),
                 input_text.as_deref(),
+                &input_images,
                 voice.as_deref(),
                 output.as_ref(),
                 target.as_deref(),
                 trace,
+                show_reasoning,
                 trace_export.as_ref(),
             )
         }
@@ -581,7 +623,10 @@ fn run_command(cli: Cli) -> Result<()> {
             voice,
             target,
             stream,
+            show_reasoning,
             system,
+            no_tools,
+            tools_file,
         } => commands::repl::handle_repl_command(
             config,
             model,
@@ -590,7 +635,10 @@ fn run_command(cli: Cli) -> Result<()> {
             voice,
             target,
             stream,
+            show_reasoning,
             system,
+            no_tools,
+            tools_file,
             verbose,
         ),
         Commands::Trace {
@@ -671,4 +719,36 @@ fn resolve_config_path(config: Option<PathBuf>, pipeline: Option<String>) -> Res
     Err(anyhow::anyhow!(
         "Either --config, --pipeline, --bundle, or --model must be specified"
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_subcommand_parses_without_arg_collisions() {
+        // clap only detects duplicate short flags (like `pack -v` vs the
+        // global `-v/--verbose`) when the subcommand's arg set is built —
+        // exercise each one so a collision fails here instead of panicking
+        // at run time.
+        use clap::CommandFactory;
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn repl_accepts_show_reasoning_flag() {
+        let parsed = Cli::try_parse_from([
+            "xybrid",
+            "repl",
+            "--show-reasoning",
+            "--model-file",
+            "model.gguf",
+        ]);
+
+        let cli = parsed.unwrap_or_else(|err| panic!("repl should accept --show-reasoning: {err}"));
+        let Commands::Repl { show_reasoning, .. } = cli.command else {
+            panic!("expected repl command");
+        };
+        assert!(show_reasoning);
+    }
 }

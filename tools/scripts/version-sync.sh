@@ -15,10 +15,25 @@ CARGO_WORKSPACE="$REPO_ROOT/Cargo.toml"
 FLUTTER_PUBSPEC="$REPO_ROOT/bindings/flutter/pubspec.yaml"
 UNITY_PACKAGE="$REPO_ROOT/bindings/unity/package.json"
 KOTLIN_GRADLE="$REPO_ROOT/bindings/kotlin/build.gradle.kts"
+# bindings/flutter/rust hardcodes `version = "..."` instead of inheriting
+# `version.workspace = true` because cargokit hashes this file's bytes to
+# decide whether the precompiled Flutter binaries need rebuilding. Without
+# a hardcoded version, every workspace bump would leave the precompiled
+# cache pointing at an out-of-date hash.
+FLUTTER_RUST_CARGO="$REPO_ROOT/bindings/flutter/rust/Cargo.toml"
 # Root SPM manifest. `let sdkVersion = "..."` drives the GitHub release-asset
 # URL for SPM consumers in remote mode and MUST match the cargo workspace
 # version.
 SWIFT_PACKAGE="$REPO_ROOT/Package.swift"
+# React Native npm package. RN is hand-translated (not generated), so it was
+# absent from this sync and its package.json drifted. Two versions must equal
+# the workspace version: the npm package version, and the `ai.xybrid:xybrid-kotlin`
+# AAR pin its Android binding consumes from Maven Central.
+RN_PACKAGE="$REPO_ROOT/bindings/react-native/package.json"
+RN_GRADLE="$REPO_ROOT/bindings/react-native/android/build.gradle"
+# Python SDK wheel manifest. Hand-maintained (the ctypes binding is not
+# generated), so like RN it must be wired here or it drifts.
+PYTHON_PYPROJECT="$REPO_ROOT/bindings/python/pyproject.toml"
 
 # Extract current workspace version from Cargo.toml
 get_cargo_version() {
@@ -43,9 +58,31 @@ get_kotlin_version() {
     grep '^version = ' "$KOTLIN_GRADLE" | sed 's/version = "\(.*\)"/\1/'
 }
 
+# Extract version from bindings/flutter/rust/Cargo.toml (the hardcoded line —
+# strip any trailing inline comment).
+get_flutter_rust_version() {
+    grep '^version = ' "$FLUTTER_RUST_CARGO" | head -1 | sed 's/version = "\(.*\)".*/\1/'
+}
+
 # Extract sdkVersion from root Package.swift
 get_swift_version() {
     grep '^let sdkVersion = ' "$SWIFT_PACKAGE" | sed 's/let sdkVersion = "\(.*\)"/\1/'
+}
+
+# Extract version from React Native package.json (parsed, like Unity's).
+get_rn_version() {
+    python3 -c "import json; print(json.load(open('$RN_PACKAGE'))['version'])"
+}
+
+# Extract the ai.xybrid:xybrid-kotlin AAR version the RN Android binding pins.
+get_rn_aar_version() {
+    grep 'ai.xybrid:xybrid-kotlin:' "$RN_GRADLE" | head -1 | sed 's/.*xybrid-kotlin:\([^"]*\)".*/\1/'
+}
+
+# Extract version from bindings/python/pyproject.toml ([project] holds the
+# file's only `version = ` line).
+get_python_version() {
+    grep '^version = ' "$PYTHON_PYPROJECT" | head -1 | sed 's/version = "\(.*\)"/\1/'
 }
 
 # Set version in Cargo workspace (all Rust crates inherit via version.workspace = true)
@@ -83,6 +120,17 @@ set_kotlin_version() {
     rm -f "$KOTLIN_GRADLE.bak"
 }
 
+# Set version in bindings/flutter/rust/Cargo.toml. The `^version = "..."`
+# anchor matches only the line under [package] (dependency entries in
+# [dependencies] use `name = { version = "..." }` syntax and start with a
+# crate name, not "version"). The trailing inline comment is preserved
+# because the `".*"` capture stops at the closing quote.
+set_flutter_rust_version() {
+    local version="$1"
+    sed -i.bak "s/^version = \".*\"/version = \"$version\"/" "$FLUTTER_RUST_CARGO"
+    rm -f "$FLUTTER_RUST_CARGO.bak"
+}
+
 # Set sdkVersion in root Package.swift. Leaves useLocalNatives and
 # xybridFFIChecksum untouched — those are managed independently
 # (set-natives-mode.sh / sync-spm-checksum.sh).
@@ -90,6 +138,36 @@ set_swift_version() {
     local version="$1"
     sed -i.bak "s/^let sdkVersion = \".*\"/let sdkVersion = \"$version\"/" "$SWIFT_PACKAGE"
     rm -f "$SWIFT_PACKAGE.bak"
+}
+
+# Set version in React Native package.json (parsed + rewritten, like Unity's —
+# robust against reformatting; preserves the file's standard 2-space layout).
+set_rn_version() {
+    local version="$1"
+    python3 -c "
+import json
+with open('$RN_PACKAGE', 'r') as f:
+    data = json.load(f)
+data['version'] = '$version'
+with open('$RN_PACKAGE', 'w') as f:
+    json.dump(data, f, indent=2)
+    f.write('\n')
+"
+}
+
+# Set the ai.xybrid:xybrid-kotlin AAR pin in the RN Android build.gradle so the
+# binding resolves the matching published Kotlin SDK at consumer build time.
+set_rn_aar_version() {
+    local version="$1"
+    sed -i.bak "s/ai.xybrid:xybrid-kotlin:[^\"]*\"/ai.xybrid:xybrid-kotlin:$version\"/" "$RN_GRADLE"
+    rm -f "$RN_GRADLE.bak"
+}
+
+# Set version in bindings/python/pyproject.toml.
+set_python_version() {
+    local version="$1"
+    sed -i.bak "s/^version = \".*\"/version = \"$version\"/" "$PYTHON_PYPROJECT"
+    rm -f "$PYTHON_PYPROJECT.bak"
 }
 
 # Check mode: verify all versions match
@@ -101,7 +179,7 @@ check_versions() {
     echo "Cargo workspace version: $cargo_version"
     echo ""
 
-    for name_func in "Flutter:get_flutter_version" "Unity:get_unity_version" "Kotlin:get_kotlin_version" "Swift:get_swift_version"; do
+    for name_func in "Flutter:get_flutter_version" "Flutter rust crate:get_flutter_rust_version" "Unity:get_unity_version" "Kotlin:get_kotlin_version" "Swift:get_swift_version" "React Native:get_rn_version" "React Native AAR:get_rn_aar_version" "Python:get_python_version"; do
         local name="${name_func%%:*}"
         local func="${name_func##*:}"
         local version
@@ -134,9 +212,13 @@ case "${1:-}" in
         VERSION="$(get_cargo_version)"
         echo "Syncing all packages to version: $VERSION"
         set_flutter_version "$VERSION"
+        set_flutter_rust_version "$VERSION"
         set_unity_version "$VERSION"
         set_kotlin_version "$VERSION"
         set_swift_version "$VERSION"
+        set_rn_version "$VERSION"
+        set_rn_aar_version "$VERSION"
+        set_python_version "$VERSION"
         echo "Done. Run '$0 --check' to verify."
         ;;
     --help|-h)
@@ -153,9 +235,13 @@ case "${1:-}" in
         echo "Setting all packages to version: $VERSION"
         set_cargo_version "$VERSION"
         set_flutter_version "$VERSION"
+        set_flutter_rust_version "$VERSION"
         set_unity_version "$VERSION"
         set_kotlin_version "$VERSION"
         set_swift_version "$VERSION"
+        set_rn_version "$VERSION"
+        set_rn_aar_version "$VERSION"
+        set_python_version "$VERSION"
         echo ""
         echo "Rust crates inherit via version.workspace = true."
 

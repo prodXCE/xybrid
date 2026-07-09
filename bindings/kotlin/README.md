@@ -2,7 +2,7 @@
 
 > **Status**: Active - Real inference via TemplateExecutor
 
-This directory contains the Android library for Xybrid, providing native Kotlin/Java support via UniFFI-generated bindings. The SDK supports real ML inference (TTS, ASR, embeddings) on-device via ONNX Runtime.
+This directory contains the Android library for Xybrid, providing native Kotlin/Java support via BoltFFI-generated bindings. The SDK supports real ML inference (TTS, ASR, embeddings) on-device via ONNX Runtime.
 
 ## Installation
 
@@ -12,7 +12,7 @@ Add to your `build.gradle.kts`:
 
 ```gradle
 dependencies {
-    implementation("ai.xybrid:xybrid-kotlin:0.1.0-beta5")
+    implementation("ai.xybrid:xybrid-kotlin:0.3.0")
 }
 ```
 
@@ -36,20 +36,14 @@ dependencies {
 ### Loading a Model from Registry
 
 ```kotlin
-import ai.xybrid.XybridModelLoader
-import ai.xybrid.XybridEnvelope
-import ai.xybrid.XybridException
+import ai.xybrid.XybridModel
+import ai.xybrid.Envelope
 
-// Load a model from the registry
-val loader = XybridModelLoader.fromRegistry("kokoro-82m")
-val model = loader.load()
+// Load a model from the registry (the constructor resolves + loads it)
+val model = XybridModel("kokoro-82m")
 
 // Run text-to-speech
-val envelope = XybridEnvelope.Text(
-    text = "Hello, world!",
-    voiceId = "af_bella",
-    speed = 1.0
-)
+val envelope = Envelope.text("Hello, world!", voiceId = "af_bella", speed = 1.0)
 val result = model.run(envelope)
 
 if (result.success) {
@@ -63,11 +57,10 @@ if (result.success) {
 ### Loading a Model from Bundle
 
 ```kotlin
-import ai.xybrid.XybridModelLoader
+import ai.xybrid.XybridModel
 
 // Load from a local bundle path
-val loader = XybridModelLoader.fromBundle("/path/to/model/bundle")
-val model = loader.load()
+val model = XybridModel.fromBundle("/path/to/model/bundle")
 ```
 
 ### Speech Recognition (ASR)
@@ -106,21 +99,53 @@ if (result.success && result.embedding != null) {
 }
 ```
 
+### Vision-Language Input
+
+```kotlin
+import ai.xybrid.Envelope
+
+val imageBytes: ByteArray = loadImageBytes()
+val image = Envelope.image(imageBytes, format = "jpeg")
+val prompt = Envelope.userMessage(
+    text = "Describe this image",
+    images = listOf(image)
+)
+
+val result = model.run(prompt)
+if (result.success) {
+    println(result.text)
+}
+```
+
+### Reasoning (thinking models)
+
+Reasoning models (metadata `reasoning: true`, e.g. `lfm2.5-1.2b-thinking`)
+produce a chain-of-thought before their answer. Xybrid keeps it out of the
+answer text and surfaces it on `reasoningContent` — `null` for non-thinking
+models. Nothing to enable; just read it if you want it.
+
+```kotlin
+import ai.xybrid.reasoningContent
+
+val result = model.run(Envelope.text("Is 97 a prime number? Reason, then answer."))
+result.text?.let { println("Answer: $it") }
+result.reasoningContent?.let { println("Reasoning: $it") }
+```
+
 ### Error Handling
 
 ```kotlin
 import ai.xybrid.XybridException
 
 try {
-    val loader = XybridModelLoader.fromRegistry("unknown-model")
-    val model = loader.load()
+    val model = XybridModel("unknown-model")
 } catch (e: XybridException.ModelNotFound) {
-    println("Model not found: ${e.modelId}")
-} catch (e: XybridException.InferenceFailed) {
+    println("Model not found: ${e.id}")
+} catch (e: XybridException.LoadError) {
+    println("Load error: ${e.message}")
+} catch (e: XybridException.InferenceError) {
     println("Inference failed: ${e.message}")
-} catch (e: XybridException.InvalidInput) {
-    println("Invalid input: ${e.message}")
-} catch (e: XybridException.IoException) {
+} catch (e: XybridException.IoError) {
     println("I/O error: ${e.message}")
 }
 ```
@@ -131,19 +156,23 @@ try {
 
 | Type | Description |
 |------|-------------|
-| `XybridModelLoader` | Factory for loading models from registry or bundle |
-| `XybridModel` | Loaded model ready for inference |
-| `XybridEnvelope` | Input data (Audio, Text, or Embedding) |
+| `XybridModel` | Loaded model ready for inference (construct/factory to load) |
+| `Envelope` | Factory for `XybridEnvelope` inputs (`text`, `audio`, `embedding`, `image`, `userMessage`) |
+| `XybridEnvelope` | Input data container |
 | `XybridResult` | Inference output with success/error and result data |
-| `XybridException` | Error types (ModelNotFound, InferenceFailed, etc.) |
+| `XybridException` | Error types (ModelNotFound, InferenceError, etc.) |
 
-### XybridModelLoader
+### XybridModel (loading)
 
-| Method | Description |
+| Call | Description |
 |--------|-------------|
-| `fromRegistry(modelId: String)` | Load model from Xybrid registry |
-| `fromBundle(path: String)` | Load model from local bundle path |
-| `load(): XybridModel` | Fetch and load the model |
+| `XybridModel(id: String)` | Resolve and load a model from the Xybrid registry |
+| `XybridModel.fromBundle(path: String)` | Load a model from a local `.xyb` bundle |
+| `XybridModel.fromDirectory(path: String)` | Load a model from an extracted directory |
+| `XybridModel.fromHuggingface(repo: String)` | Resolve and load a HuggingFace repo |
+
+Each loads synchronously; use the `…Async` suspend variants
+(`XybridModel.fromRegistryAsync(id)`, etc.) to load off the calling thread.
 
 ### XybridEnvelope
 
@@ -152,6 +181,8 @@ try {
 | `Audio` | `bytes: ByteArray`, `sampleRate: UInt`, `channels: UInt` |
 | `Text` | `text: String`, `voiceId: String?`, `speed: Double?` |
 | `Embedding` | `data: List<Float>` |
+| `Image` | `bytes: ByteArray`, `format: String` |
+| `UserMessage` | `text: String`, `images: List<XybridEnvelope>` |
 
 ### XybridResult
 
@@ -171,28 +202,31 @@ try {
 kotlin/
 ├── build.gradle.kts                     # Gradle build configuration
 ├── README.md                            # This file
-├── libs/                                # Prebuilt native libraries
+├── libs/                                # Native libraries (libxybrid-bolt.so built locally/CI, not committed)
 │   ├── armeabi-v7a/
-│   │   └── libxybrid_uniffi.so
+│   │   └── libxybrid-bolt.so
 │   ├── arm64-v8a/
-│   │   ├── libxybrid_uniffi.so
+│   │   ├── libxybrid-bolt.so
 │   │   ├── libonnxruntime.so            # ORT shared library (symlink → vendor/)
 │   │   └── libc++_shared.so             # C++ runtime (symlink → vendor/)
 │   └── x86_64/
-│       ├── libxybrid_uniffi.so
+│       ├── libxybrid-bolt.so
 │       ├── libonnxruntime.so            # ORT shared library (symlink → vendor/)
 │       └── libc++_shared.so             # C++ runtime (symlink → vendor/)
 └── src/main/kotlin/ai/xybrid/
-    └── xybrid_uniffi.kt                 # UniFFI-generated bindings
+    ├── Xybrid.kt                         # Public convenience API
+    └── XybridBolt.kt                     # BoltFFI-generated bindings
 ```
 
 ## Native Dependencies
 
-The SDK bundles ONNX Runtime (`libonnxruntime.so`) and the C++ shared library (`libc++_shared.so`) alongside `libxybrid_uniffi.so`. These are included automatically in the AAR — no manual setup required.
+The SDK bundles ONNX Runtime (`libonnxruntime.so`) and the C++ shared library (`libc++_shared.so`) alongside `libxybrid-bolt.so`. These are included automatically in the AAR — no manual setup required.
+
+> **Note:** `libxybrid-bolt.so` is a build output and is **not** committed to the repository. The AAR published to Maven Central includes it (built in CI). For a **local** build, generate it first with `cargo xtask build-android` (see [Building Native Libraries](#building-native-libraries) below) so `libs/<abi>/` is populated before running `./gradlew`.
 
 | Library | Purpose | Source |
 |---------|---------|--------|
-| `libxybrid_uniffi.so` | Xybrid Rust SDK via UniFFI | Built from `crates/xybrid-uniffi/` |
+| `libxybrid-bolt.so` | Xybrid Rust SDK via BoltFFI | Built from `crates/xybrid-bolt/` |
 | `libonnxruntime.so` | ONNX Runtime inference engine | Vendored at `vendor/ort-android/` |
 | `libc++_shared.so` | C++ standard library runtime | Vendored at `vendor/ort-android/` |
 
@@ -200,10 +234,9 @@ ORT libraries are symlinked from the shared `vendor/ort-android/` directory (mat
 
 ## FFI Strategy
 
-The Kotlin bindings are generated from `crates/xybrid-uniffi/` using UniFFI:
-- Single Rust source generates both Swift and Kotlin bindings
+The Kotlin bindings are generated from `crates/xybrid-bolt/` using [BoltFFI](https://crates.io/crates/boltffi):
+- Single Rust source generates Swift, Kotlin, Java, C#, WASM, and a C header
 - Memory-safe wrappers with proper resource cleanup
-- Uses JNA for native library loading
 
 ## Building Native Libraries
 
@@ -295,9 +328,9 @@ export CARGO_TARGET_ARMV7_LINUX_ANDROIDEABI_LINKER="$ANDROID_NDK_HOME/toolchains
 export CARGO_TARGET_X86_64_LINUX_ANDROID_LINKER="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/darwin-x86_64/bin/x86_64-linux-android21-clang"
 
 # Build each target
-cargo build -p xybrid-uniffi --lib --release --target aarch64-linux-android
-cargo build -p xybrid-uniffi --lib --release --target armv7-linux-androideabi
-cargo build -p xybrid-uniffi --lib --release --target x86_64-linux-android
+cargo build -p xybrid-bolt --lib --release --target aarch64-linux-android
+cargo build -p xybrid-bolt --lib --release --target armv7-linux-androideabi
+cargo build -p xybrid-bolt --lib --release --target x86_64-linux-android
 ```
 
 ### Build Output
@@ -307,24 +340,24 @@ After a successful build:
 ```
 bindings/kotlin/libs/
 ├── arm64-v8a/
-│   ├── libxybrid_uniffi.so
+│   ├── libxybrid-bolt.so
 │   ├── libonnxruntime.so         # Bundled from vendor/ort-android/
 │   └── libc++_shared.so          # Bundled from vendor/ort-android/
 ├── armeabi-v7a/
-│   └── libxybrid_uniffi.so
+│   └── libxybrid-bolt.so
 ├── x86_64/
-│   ├── libxybrid_uniffi.so
+│   ├── libxybrid-bolt.so
 │   ├── libonnxruntime.so         # Bundled from vendor/ort-android/
 │   └── libc++_shared.so          # Bundled from vendor/ort-android/
 └── {version}/                    # Versioned copy
     ├── arm64-v8a/
-    │   ├── libxybrid_uniffi.so
+    │   ├── libxybrid-bolt.so
     │   ├── libonnxruntime.so
     │   └── libc++_shared.so
     ├── armeabi-v7a/
-    │   └── libxybrid_uniffi.so
+    │   └── libxybrid-bolt.so
     └── x86_64/
-        ├── libxybrid_uniffi.so
+        ├── libxybrid-bolt.so
         ├── libonnxruntime.so
         └── libc++_shared.so
 ```
@@ -375,7 +408,7 @@ export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/26.1.10909125"
 **Cause**: Missing native library or corrupted .so file.
 
 **Fix**:
-1. Verify the .so file is valid: `file libs/arm64-v8a/libxybrid_uniffi.so`
+1. Verify the .so file is valid: `file libs/arm64-v8a/libxybrid-bolt.so`
 2. Should show: `ELF 64-bit LSB shared object, ARM aarch64`
 3. Rebuild with `cargo xtask build-android`
 

@@ -7,9 +7,465 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Planned (0.1.x)
+### Planned
 
-- **OpenUPM registry**: Publish Unity SDK to [openupm.com](https://openupm.com) for scoped registry install
+- **Multimodal KV-prefix reuse**: the per-frame prefill cost lever for live vision — **deferred** from 0.2.0, not yet implemented.
+
+---
+
+## [0.3.0] - 2026-07-06
+
+Local tool calling, Unity on OpenUPM, and honest cache clearing. The local
+llama.cpp backend gains function/tool calling; the Unity SDK is re-platformed
+onto a managed-only OpenUPM package that fetches its natives at import; and the
+model-cache clear/discovery paths are corrected to report what they actually
+remove.
+
+### Changed
+
+- **Unity SDK distribution moved to OpenUPM** (#321, #324). The Unity package now
+  ships managed-only via the OpenUPM scoped registry (`ai.xybrid`); per-platform
+  native libraries are downloaded from the GitHub Release at import by an editor
+  resolver (SHA-256 verified) into `Assets/Xybrid/Plugins/`, **including the
+  ~326 MB iOS slice** that previously required manual setup. **Breaking for Unity
+  consumers:** the `#upm` git-branch install is replaced (install via OpenUPM or
+  the `?path=/bindings/unity` git URL), and the `publish-upm` CI job is retired.
+- **Model cache clearing reports what it removed** (#309). **Breaking:** `clear()`
+  / `clear_model_roots()` now return the number of cache *roots* removed (was the
+  scanned `.xyb` entry count, ~0 for the nested registry-bundle layout), and the
+  CLI now warns when nothing was cached instead of always reporting success.
+  `cache_root()` keeps `extracted/`, `hf/`, and `hf-hub/` co-located under the
+  cache root for a bare relative `models` root instead of resolving them
+  CWD-relative. `clear*` operations are documented as unsafe against concurrent
+  loads.
+
+### Added
+
+- **Local tool calling for the llama.cpp backend** (#323): function/tool calls
+  are parsed from local LLM output for LFM2 and Gemma-family models, with
+  streaming tool-call continuation, an example, and a CLI REPL. See the
+  tool-calling guide.
+- **Unity native-library resolver + release bundles** (#321). An editor resolver
+  downloads/verifies the per-platform natives on import and before player builds;
+  CI publishes `xybrid-unity-native-<platform>-v<version>.zip` bundles + a
+  SHA-256 manifest as release assets (managed by `cargo xtask package-unity-natives`).
+
+### Fixed
+
+- **Internal path-dep pins** realigned to the workspace version (#318).
+
+---
+
+## [0.2.2] - 2026-07-04
+
+Structured output on-device. The local llama.cpp backend can now be constrained
+to a grammar so small models (e.g. LFM2.5-230M) emit guaranteed-valid JSON for
+data-extraction workloads, and that capability is exposed across every binding.
+
+### Added
+
+- **JSON-Schema / GBNF constrained decoding for the local llama backend**
+  (#310): `GenerationConfig` gains a `grammar` field with chainable
+  `with_grammar` / `with_json_schema` builders, backed by a new
+  JSON-Schema→GBNF converter (`runtime_adapter::grammar`) covering the
+  object / array / scalar / enum subset, including nullable (`["string","null"]`)
+  fields and `\uXXXX` escapes. The grammar is prepended to the llama.cpp sampler
+  chain at the single shared chokepoint, so all generate paths are constrained
+  with no new type crossing the ABI. Ships with an end-to-end
+  `lfm2_230m_grammar` example proving schema-valid receipt→JSON extraction on
+  LFM2.5-230M where the unconstrained baseline fails. New
+  `XybridError::Grammar` variant.
+- **Grammar constraint exposed across all FFI surfaces** (#311): structured
+  output now works from Swift, Kotlin, C, and Dart. The SDK re-exports
+  `json_schema_to_gbnf` / `json_schema_str_to_gbnf` / `GrammarError`; the schema
+  crosses the FFI boundary as text and is converted natively. Bolt (Swift /
+  Kotlin), the C ABI (`xybrid_generation_config_set_grammar`,
+  `xybrid_json_schema_to_gbnf`), and Flutter (`FfiGenerationConfig.grammar`,
+  `jsonSchemaToGbnf`) all gain the `grammar` field and converter; committed
+  Swift/Kotlin wrappers, the C header, and the FRB bindings are regenerated.
+
+### Fixed
+
+- **Compact JSON from schema→GBNF** (#310): the converter's whitespace rule
+  allowed unbounded inter-token whitespace, letting a greedy model emit newlines
+  until `max_tokens` (truncated output, `finish_reason=length`). The converter
+  now emits compact (minified) JSON to remove the trap; output stays valid JSON.
+- **Grammar converter robustness** (#310): NULL-check the llama sampler chain
+  before use; error on non-object `properties` instead of silently matching
+  `{}`; JSON-escape object keys before GBNF-escaping so control characters match
+  their JSON-escaped form.
+
+---
+
+## [0.2.1] - 2026-06-25
+
+The native VLM ships enabled. `0.2.0` landed the vision *foundation* — image
+envelopes, preprocessing, and the mtmd backend in the codebase — but kept the
+native VLM backend opt-in, so the default mobile/desktop binaries could not
+actually run a vision-language model. `0.2.1` turns it on in every platform
+preset: vision-language inference works out of the box, at a measured
+~0.7–1.5 MiB stripped size cost.
+
+### Added
+
+- **Native VLM backend shipped enabled** (#296): `llm-llamacpp-vision`
+  (llama.cpp's mtmd/clip) is now part of every platform preset
+  (`platform-android` / `platform-ios` / `platform-macos` / `platform-desktop`),
+  so the default XCFramework, Android AAR, Flutter/React Native natives, and CLI
+  run vision-language models with no build-from-source step. The prebuilt-natives
+  CI now publishes `vision` slices alongside `base`, so vision builds stay on the
+  fast cached path instead of recompiling llama.cpp.
+
+### Fixed
+
+- **Unrecognized GGUF chat templates now render** (#304): when llama.cpp's
+  hardcoded template matcher rejects a model's embedded chat template, xybrid
+  falls back to a real Jinja engine (minijinja) to render it instead of failing
+  — so GGUF models with custom or non-standard chat templates load and run
+  correctly. Gated into `llm-llamacpp`, so non-llama builds pay zero cost.
+- **Readable Apple FFI errors** (#296): `FfiError` now conforms to
+  `LocalizedError`, so model-load and other low-level FFI failures surface their
+  real message (e.g. a registry `ModelNotFound`) instead of the opaque
+  "The operation couldn't be completed. (Xybrid.FfiError error 1.)".
+- **Release tooling**: `version-sync` is now React-Native-aware (#298), and a
+  spurious `bindings/flutter/rust/Cargo.lock` that broke dependency resolution
+  was removed (#300).
+
+---
+
+## [0.2.0-rc1] - 2026-06-21
+
+Release candidate for `0.2.0`. This is the stable `0.2.0` tree under a
+prerelease tag — published across every distribution channel (crates.io,
+pub.dev, Maven Central, SPM) so consumers can validate the vision/BoltFFI
+release against real integrations before the final tag. No functional changes
+from the `0.2.0` candidate — see the [0.2.0] entry below for the full change
+set.
+
+---
+
+## [0.2.0-alpha] - 2026-06-19
+
+Prerelease of `0.2.0` cut to validate the release pipeline and exercise the
+new BoltFFI binding surface across every distribution channel (crates.io,
+pub.dev, Maven Central, SPM) ahead of the stable tag. No functional changes
+from the `0.2.0` candidate — see the [0.2.0] entry below for the full change
+set.
+
+---
+
+## [0.2.0] - 2026-06-17
+
+The vision release. xybrid gains an on-device multimodal stack — VLM inference,
+real-time camera vision primitives, and streaming TTS — and the FFI surface is
+re-platformed from UniFFI onto BoltFFI through a single shared facade. This is a
+**breaking release** for binding consumers: the Swift / Kotlin / Java / C# / RN
+bindings are now generated through `xybrid-bolt` + `xybrid-ffi-facade` rather
+than UniFFI, and the run/envelope call shapes changed accordingly.
+
+### Added
+
+- **On-device vision foundation** (#245): VLM inference, real-time camera vision
+  primitives, and streaming TTS land in the runtime. The vision pipeline is now
+  unconditional rather than feature-gated (#263).
+- **Vision envelopes through bolt** (#265): `Image` / `MultiPart` envelopes and
+  typed capability errors are threaded through the BoltFFI bindings; generation
+  config is now plumbed through `XybridModel.run` (#262).
+- **Reachable streaming cancellation**: cancelling a streaming generation drives a
+  real runtime abort end-to-end (`FfiCancellationToken` + options-aware streaming
+  routing + sink-closed-as-cancel), so generation halts at the next token and
+  releases the model lock. `UserCancelled` is the default abort outcome.
+- **Preemptive cancel-and-replace slot** on the model handle: a new run can preempt
+  the in-flight run (latest-frame-wins), so a live loop no longer head-of-line-blocks
+  behind a stale frame.
+- **Raw-frame `mtmd` path + `imageRaw` binding**: a packed-RGB `mtmd_bitmap_init`
+  shim routes `ImageSource::Raw` through `mtmd` without per-frame JPEG re-encoding;
+  the `imageRaw` envelope binding is exposed to Dart/FRB. The encoded `image` path
+  is unchanged and remains the fallback.
+- **Live-mode telemetry tagging + per-session sampler**: live inferences are tagged
+  (`live_mode` + `frame_session_id`) and rate-limited by a per-session sampler
+  (≈1 row/sec/session, TTL-bounded), so live sessions don't emit a telemetry row
+  per frame.
+- **Speculative cloud loader decision layer** (#250): `set_speculative_cloud` +
+  `ModelLoader::with_speculative_cloud` / `will_speculate` let the loader begin a
+  cloud execution while the local model is still downloading.
+- **React Native binding** (#93, #260): a React Native binding, now ported onto
+  BoltFFI alongside the other foreign-language bindings, with a runnable Expo
+  example and an Android build-from-source CI gate (#294).
+- **Async/suspend conveniences restored** (#269) for Swift and Kotlin load + run.
+- **Model `warmup` / `unload` exposed on Flutter** (#293), filling the sync/async
+  symmetry across the binding surface.
+
+### Changed
+
+- **FFI bindings migrated from UniFFI to BoltFFI** (#205) via a shared
+  `xybrid-ffi-facade` — one canonical SDK→foreign-language translation feeding the
+  Swift / Kotlin / Java / C# / WASM bindings. **Breaking** for binding consumers.
+- **Executor decomposition**: LLM envelope and gen-config helpers deduped (#261),
+  LLM telemetry extracted into `execution::llm_telemetry` (#251), and TTS chunking
+  + audio crossfade extracted from the executor (#239).
+- **iOS LiveVision example** migrated to the bolt `run()` shape (#267).
+- **Docs**: docs site refreshed — restored deploys, surfaced hidden nav, added
+  missing pages (#254); local-first foundation vs additive platform layer
+  clarified (#248).
+- **Release/CI**: `llama-cpp-sys` renamed to `xybrid-llama-sys` (#247) and both
+  `xybrid-llama-sys` + `xybrid-llama` now publish to crates.io (#246); native
+  build cache is warmed on master pushes (#268); Swift + Kotlin wrapper compiles
+  are gated in CI (#275). A prebuilt-llama.cpp-slices pipeline on ghcr
+  (compile-once/link-many) now covers Android (3 ABIs), iOS device + simulator,
+  and Linux x86_64, cutting native build time from ~25 min to seconds
+  (#281, #284–#286, #288, #289, #291).
+
+### Fixed
+
+- **BoltFFI CLI/runtime aligned to 0.25.3** (#276): a CLI/runtime skew mis-generated
+  unit-ok `Result<(), E>` exports (model warmup/unload) as a `void` foreign function
+  that dropped the error and leaked the result buffer; pinned in lockstep.
+- **Android `.so` is strip-safe and 16 KB-page aligned** (#287): the bolt `.so` now
+  links `c++_shared` + 16 KB alignment via a clang shim instead of a post-link
+  patchelf step (which appended a LOAD segment AGP strip corrupted, crashing
+  `dlopen` on 16 KB-page devices); guarded by a dlopen CI gate.
+- **Kotlin image format validation** restored and `EnvelopeTest` fixed for the bolt
+  envelope shape (#266); `displayMessage` `when()` made exhaustive over the new
+  error variants (#273).
+- **iOS-simulator bindgen** now passes clang the canonical simulator triple (#274),
+  unblocking the cross-compile vision compile-check.
+- **`tokens_out` emitted** on local LLM telemetry paths (#253).
+- **`.npz` voice files detected** by magic header rather than extension (#252).
+- **TTS text chunking is UTF-8-safe** (#249) — no longer splits multi-byte
+  codepoints mid-character.
+
+---
+
+## [0.1.2] - 2026-06-06
+
+A robustness and supply-chain hardening release. The headline is a sweeping
+panic-safety pass across `xybrid-core` and `xybrid-sdk` — poisoned locks,
+unchecked arithmetic, and non-contiguous tensors no longer abort the process —
+plus a wider set of audio input formats and a leaner, restructured native build.
+No public API changes.
+
+### Added
+
+- **Audio format detection for MP3, OGG, and FLAC** (#132): `AudioFormat::detect_format`
+  now recognizes these container formats in addition to WAV.
+- **Mono → stereo upmixing** in `prepare_audio_samples` (#141): mono inputs are
+  upmixed to stereo when a model expects two channels.
+
+### Changed
+
+- **`llama.cpp` integration split** into `llama-cpp-sys` + `xybrid-llama` crates (#166),
+  separating the `-sys` build from the higher-level backend.
+- **`resolve_file_path` consolidated** into `execution::path` (#238); the SDK chains
+  error causes via `#[source]` instead of stringizing them (#220).
+- **Generated native libraries (~125MB) are no longer committed** (#226): they are
+  built/downloaded rather than vendored into git.
+- **CI**: each release now ships a CycloneDX SBOM (#230); the release flow unblocks
+  pub.dev publishing, the merge gate, and draft re-creation (#218).
+- **Deps**: `console` 0.15 → 0.16 (#29); `base64` 0.21 → 0.22 (#34).
+
+### Fixed
+
+- **Panic-safety hardening across core and SDK**: poisoned-lock recovery instead of
+  panicking in the llama.cpp `is_loaded` context lock (#237), the telemetry-session
+  lock (#236), the SDK telemetry locks (#234), the event-bus locks (#233), and the
+  routing-engine lock (#228); `with_retry` no longer panics when the circuit is open
+  for every attempt (#227).
+- **Checked arithmetic** in the WAV chunk parser (#232) and the voice-codes length
+  header (#231), and **non-contiguous ONNX output tensors** are now handled without
+  panicking (#235).
+- **Keep the Xybrid API key out of the process environment** (#214).
+- **Keep the test-fixtures fallback out of release builds** (#225).
+- **Honor `Retry-After` on registry `429` responses** (#134).
+
+### Docs
+
+- Added governance, maintainers, dependency, and release-verification docs (#224),
+  plus an OpenSSF Best Practices badge (#221).
+- Documented the two `candle` unsafe blocks with SAFETY comments (#229).
+- Examples inject `apiKey` + `ingestUrl` via platform-native env vars (#219); install
+  versions synced and the stale Pipelines concept page removed (#222).
+
+### Known issues
+
+- **iOS Simulator slice still missing from the published xcframework**
+  ([#179](https://github.com/xybrid-ai/xybrid/issues/179)): unchanged from 0.1.0.
+  Swift consumers building against the iOS Simulator on Apple Silicon still need the
+  `useLocalNatives = true` workaround after vendoring the ORT iOS simulator slice.
+
+### Consumer install lines
+
+```swift
+// Swift Package Manager
+.package(url: "https://github.com/xybrid-ai/xybrid", from: "0.1.2")
+```
+
+```yaml
+# Flutter / pub.dev
+xybrid_flutter: ^0.1.2
+```
+
+---
+
+## [0.1.1] - 2026-05-30
+
+First patch on the 0.1.0 line. Headline is the new `Xybrid.init()` entry point —
+anonymous-by-default telemetry wired up uniformly across every binding — plus a
+round of FFI soundness/safety hardening across the C ABI.
+
+### Added
+
+- **`Xybrid.init()` builder with anonymous-by-default telemetry** (#188): a single
+  SDK entry point that starts telemetry from an API key, anonymous unless configured
+  otherwise. Brought to every binding in lockstep: Swift `Xybrid.initialize()` (#196),
+  Kotlin `Xybrid.init()` (#201), Unity `XybridClient.Initialize()` (#202), and the
+  Flutter bundled `init()` (#195, which also marks the old `initTelemetry` legacy).
+- **Error retryability across bindings**: inherent `SdkError::is_retryable` /
+  `retry_after` (#198), surfaced to Swift and Kotlin through UniFFI (#200).
+- **Typed `XybridOutputType` enum** for the result output kind in the C FFI (#194).
+- **Telemetry stamps `sdk_version` and `binding`** on every `PlatformEvent` (#183),
+  so events are attributable to the SDK build and language binding that emitted them.
+
+### Changed
+
+- **SDK**: one shared blocking body backs pipeline `run` / `run_async` (#210);
+  platform detection deduplicated to a single `cfg` ladder (#206).
+- **FFI**: handle-lifecycle helpers consolidated behind a macro (#192).
+- **Docs**: READMEs and reference docs aligned with the bundled `init()` telemetry
+  (#204); the Flutter example reads `XYBRID_API_KEY` at init (#207); SAFETY comments
+  added to every `llama_cpp` unsafe block and impl (#191).
+- **CI**: workflow token permissions scoped to least privilege (#211); native build
+  workflows skipped on markdown-only changes (#208); docs deploy only when `docs/`
+  changes (#186); apple release-prep jobs parallelized, NDK cached (#184); verify-release
+  SPM + Flutter version parsing tightened (#182).
+
+### Fixed
+
+- **Redact Xybrid's own api-key prefix in telemetry** (#209): the SDK no longer leaks
+  the leading bytes of its own key into emitted events.
+- **Cache TTL clock handling is now panic-safe** (#203): a backwards clock no longer
+  panics the cache layer.
+- **FFI soundness and panic-safety**:
+  - removed the unsound `unsafe impl Sync` from `StreamCallbackCtx` (#187);
+  - every `extern "C"` body now guards against panics unwinding across the C ABI (#185);
+  - accessor strings are cached in handle state to fix a use-after-free contract (#189).
+
+### Known issues
+
+- **iOS Simulator slice still missing from the published xcframework**
+  ([#179](https://github.com/xybrid-ai/xybrid/issues/179)): unchanged from 0.1.0.
+  Swift consumers building against the iOS Simulator on Apple Silicon still need the
+  `useLocalNatives = true` workaround after vendoring the ORT iOS simulator slice.
+
+### Consumer install lines
+
+```swift
+// Swift Package Manager
+.package(url: "https://github.com/xybrid-ai/xybrid", from: "0.1.1")
+```
+
+```yaml
+# Flutter / pub.dev
+xybrid_flutter: ^0.1.1
+```
+
+---
+
+## [0.1.0] - 2026-05-27
+
+Production release of the 0.1.0 line. No code changes since rc4 — this release closes the rc series and finalizes the release toolchain that was iterated through rc1 → rc4.
+
+### Release infrastructure (since rc4)
+
+- **SLSA build provenance attestations** (#178): Every release asset (XCFramework zip, Android `.so` zip, all CLI binaries) is now signed and recorded in GitHub's transparency log via Sigstore. Consumers verify with `gh attestation verify <file> --repo xybrid-ai/xybrid`.
+- **Consumer-side resolution verification** (#177): `just verify-release <version>` spins up minimal consumer projects in a tmp dir for each registry (SPM / Cargo / Flutter pub.dev / Maven Central) and runs end-to-end resolution against the published artifacts. Also exercises an iOS Simulator xcodebuild against `examples/ios/XybridExample`.
+- **pub.dev OIDC binding moved to GitHub Actions environment** (#176): The trusted-publisher binding now gates on a `pub-dev-publish` environment claim rather than a tag-pattern claim, decoupling pub.dev publishes from the workflow trigger type. (See [#179](https://github.com/xybrid-ai/xybrid/issues/179) follow-up — full automation of pub.dev publishes pending.)
+- **`workflow_dispatch` recovery path on `release-publish.yml`** (#175): If the `pull_request: closed` event doesn't reach Actions (race condition, deleted PR, etc.) the publish flow can be re-run manually with `gh workflow run release-publish.yml --field tag=v<version>`. The publish-release step is gated on `isDraft=true` so it's a no-op when the release is already live.
+
+### Cumulative highlights — what 0.1.0 ships (vs. 0.1.0-rc3)
+
+Everything that landed in rc4 is in 0.1.0:
+
+- **`InferenceMetrics` across every binding** (INF-15 series, #120, #131, #135, #138, #139, #142): typed per-inference CPU / memory / GPU / wall-clock metrics now visible from Rust SDK, Kotlin + Swift (UniFFI), Dart (`XybridResult`), and Unity (C FFI accessors). Surfaced in the bundled Flutter demos and Unity docs.
+- **Streaming-LLM cloud fallback uses live device signals** (#121): real CPU / memory / thermal pressure feeds the routing decision instead of static thresholds.
+- **`ModelWarmup` telemetry events** (#158 + #164): `XybridModel::warmup` emits dedicated `ModelWarmup` spans; warmup events drain on event boundaries so they don't bleed into subsequent inferences.
+- **`streaming` field hoisted to top-level `PlatformEvent`** (#162): downstream consumers no longer descend into metadata to filter streaming events.
+- **GGUF backend label defaults to `llamacpp`** (#119): unannotated GGUF bundles attribute correctly in telemetry instead of showing `unknown`.
+- **`Denormalize` postprocessing step** (#133): inverse of `Normalize`, useful for round-tripping model output back into input-space coordinates.
+- **Release-branch flow** (#169, #171, #173): replaces the tag-driven release. `release-prep.yml` + `release-publish.yml` keep master's SPM checksum in sync, eliminate force-moved tags, and stage every release through a reviewable PR + draft release.
+
+### Fixed
+
+- **SPM `branch: "master"` consumers** unblocked (#167, #169): the new release-branch flow keeps master's `Package.swift` `xybridFFIChecksum` in sync with the released xcframework. The recommended consumer line is now `from: "0.1.0"`, but `branch: "master"` works too.
+- Streaming fast-path `ModelComplete` events restored (#137), orchestrator pipeline-frame events filtered at SDK bridge (#146), CLI REPL routes cached models locally (#165), warmup span collector drains on event boundary (#164) — all from rc4.
+
+### Known issues — deferred to v0.1.1
+
+- **iOS Simulator slice missing from the published xcframework** ([#179](https://github.com/xybrid-ai/xybrid/issues/179)): Swift consumers cannot build against the iOS Simulator on Apple Silicon without a workaround. Pre-existed in rc1 through rc4. Workaround: build locally with `useLocalNatives = true` after vendoring the ORT iOS simulator slice.
+- **pub.dev publish requires one manual step**: `flutter pub publish -f` from a maintainer's machine after merging the release PR. Refactor tracked separately.
+
+### Consumer install lines
+
+```swift
+// Swift Package Manager
+.package(url: "https://github.com/xybrid-ai/xybrid", from: "0.1.0")
+```
+
+```yaml
+# Flutter / pub.dev
+xybrid_flutter: ^0.1.0
+```
+
+```toml
+# Rust / crates.io
+xybrid = "0.1.0"
+```
+
+```kotlin
+// Kotlin / Maven Central
+implementation("ai.xybrid:xybrid-kotlin:0.1.0")
+```
+
+```sh
+# Unity / UPM
+https://github.com/xybrid-ai/xybrid.git#upm
+```
+
+---
+
+## [0.1.0-rc4] - 2026-05-26
+
+### Added
+
+- **`InferenceMetrics` on result types across every binding** (INF-15 — #120, #131, #135, #138): Typed per-inference metrics (CPU / memory / GPU / wall-clock) are now exposed on the SDK result type and threaded through to Kotlin + Swift (UniFFI), Dart (`XybridResult`), and Unity (C FFI accessors). Flutter demos and Unity docs now surface them end-to-end (#139, #142).
+- **Live-signal routing for streaming cloud fallback** (#121): The streaming-LLM fallback policy now consumes real-time device pressure signals (CPU / memory / thermal) instead of static thresholds when deciding whether to spill to cloud.
+- **`ModelWarmup` telemetry event** (#158): `XybridModel::warmup` now emits a dedicated `ModelWarmup` span; the CLI REPL routes its warmup through this event so first-token latency is attributable to warmup vs. inference.
+- **`streaming` field hoisted to `PlatformEvent` top-level payload** (#162): Previously nested under metadata, now a top-level field so downstream consumers don't have to descend into the payload to filter streaming events.
+- **GGUF backend label defaults to `llamacpp` on unannotated bundles** (#119): Telemetry events from bundles that don't carry an explicit backend tag now default to `llamacpp` rather than `unknown`, so dashboards correctly attribute GGUF traffic.
+- **`Denormalize` postprocessing step in core** (#133): New core postprocessing primitive that inverts a `Normalize` step, useful for round-tripping model output back into input-space coordinates.
+
+### Fixed
+
+- **`ModelComplete` events on streaming fast-path inference** (#137): The streaming fast-path was skipping the `ModelComplete` emission, leaving downstream consumers waiting on a terminal event that never arrived. Now emitted on every path.
+- **Orchestrator pipeline-frame events filtered at SDK bridge** (#146): Internal `PipelineFrame` events from the orchestrator no longer leak to binding consumers as opaque payloads.
+- **REPL routes cached models locally** (#165): The CLI REPL was occasionally re-resolving cached models through the cloud router; it now short-circuits to the local cache when the model is present on disk.
+- **`ModelWarmup` span collector drained on event boundary** (#164): Warmup spans were leaking into the subsequent event's batch; the span collector is now drained when `ModelWarmup` is published.
+- **SPM consumers on `branch: "master"` no longer hit checksum mismatch** (#167, #169): The new release-branch flow keeps master's `Package.swift` `xybridFFIChecksum` in sync with the released xcframework asset. Tag-pinned (`exact:` / `from:`) and `branch: "swift"` consumers were unaffected; this fixes the `branch: "master"` case that had been silently broken since rc1.
+
+### Build / CI
+
+- **Release-branch flow** (#169, #171): New `release-prep.yml` + `release-publish.yml` workflows. A maintainer cuts `release/v<version>`, runs `just bump-version`, and pushes — CI builds every artifact, patches the SPM checksum back to the branch, creates a draft GitHub Release with all assets, and opens a PR to master. Merging the PR publishes the draft (tag created at merge commit) and publishes to crates.io / pub.dev / Maven Central. The legacy `release.yml` is kept as a `workflow_dispatch`-only break-glass.
+- **`version-sync.sh` now bumps `bindings/flutter/rust/Cargo.toml`** (#173): `just bump-version` was silently leaving the Flutter rust crate behind because the crate hardcodes its version (cargokit hashes the file). The bump script now keeps it in sync; master's previously-stale rc1 version is brought up too.
+- **`publish-crates` job pushes the four crates to crates.io** (#143, #145): `xybrid-macros`, `xybrid-core`, `xybrid-sdk`, and the `xybrid` umbrella now publish from the release workflow.
+- **Discord notifications + contributor welcome workflow** (#147, #148): Release publish notifies the project Discord; new contributors get a welcome message on their first PR.
+
+### Docs
+
+- **Vision envelopes + multi-part user messages** (#123): SDK docs now cover the input shape for vision payloads and the multi-part message format.
+- **`XYBRID_LLAMACPP_VERBOSITY` env var documented** (#156).
+- **Doctest examples compile under `no_run`** (#168): All public-API doctests now compile cleanly even without runtime dependencies present, so `cargo test --doc` runs green in CI.
+- **README install snippets bumped to 0.1.0-rc4** (this release, see also #157 for the rc3 equivalent).
+- **New-contributor pointers** (#130): READMEs now point first-time contributors at the `good-first-issue` and area labels.
 
 ---
 

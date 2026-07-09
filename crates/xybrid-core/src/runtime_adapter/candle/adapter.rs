@@ -21,7 +21,8 @@ use candle_core::Device;
 ///
 /// # Example
 ///
-/// ```rust,ignore
+/// ```no_run
+/// # fn _example() -> Result<(), Box<dyn std::error::Error>> {
 /// use xybrid_core::runtime_adapter::candle::CandleRuntimeAdapter;
 /// use xybrid_core::runtime_adapter::RuntimeAdapter;
 /// use xybrid_core::ir::{Envelope, EnvelopeKind};
@@ -32,6 +33,9 @@ use candle_core::Device;
 /// let audio_bytes = std::fs::read("audio.wav")?;
 /// let input = Envelope::new(EnvelopeKind::Audio(audio_bytes));
 /// let output = adapter.execute(&input)?;
+/// # let _ = output;
+/// # Ok(())
+/// # }
 /// ```
 pub struct CandleRuntimeAdapter {
     /// Loaded models (model_id -> WhisperModel)
@@ -207,6 +211,13 @@ impl RuntimeAdapter for CandleRuntimeAdapter {
             EnvelopeKind::Text(_) => Err(AdapterError::InvalidInput(
                 "Whisper expects Embedding (mel spectrogram) input, not Text".to_string(),
             )),
+            EnvelopeKind::Image { .. } | EnvelopeKind::MultiPart(_) => {
+                Err(AdapterError::UnsupportedModelCapability {
+                    model_id: model_id.clone(),
+                    capability: "image input".to_string(),
+                    hint: "Candle Whisper models accept preprocessed mel embeddings; select a VisionLanguage model and a llama.cpp vision build for image input.".to_string(),
+                })
+            }
         }
     }
 }

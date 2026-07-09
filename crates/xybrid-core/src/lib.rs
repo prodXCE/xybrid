@@ -21,13 +21,19 @@
 //!
 //! Use the [`prelude`] module for common imports:
 //!
-//! ```rust,ignore
+//! ```no_run
+//! # fn _example() -> Result<(), Box<dyn std::error::Error>> {
 //! use xybrid_core::prelude::*;
 //!
+//! # let audio_bytes: Vec<u8> = vec![];
+//! # let metadata: xybrid_core::execution::ModelMetadata = unimplemented!();
 //! // Create an executor and run inference
 //! let mut executor = TemplateExecutor::with_base_path("models/whisper");
-//! let input = Envelope::from_audio(audio_bytes);
-//! let output = executor.execute(&metadata, &input)?;
+//! let input = Envelope::new(EnvelopeKind::Audio(audio_bytes));
+//! let output = executor.execute(&metadata, &input, None)?;
+//! # let _ = output;
+//! # Ok(())
+//! # }
 //! ```
 //!
 //! ## Module Organization
@@ -53,9 +59,17 @@
 //! - [`bundler`] - .xyb bundle creation and extraction
 //!
 //! ### High-Level APIs
-//! - [`cloud`] - Cloud client (third-party API integrations)
 //! - [`tts`] - Text-to-speech client
+//!
+//! ### Platform / control-plane (additive)
+//!
+//! Opt-in capabilities layered on the local engine — they extend the same
+//! runtime, they don't replace the offline path. See `CLAUDE.md` ("What xybrid
+//! is") for the foundation-vs-platform split.
+//! - [`cloud`] - Cloud client + API-key auth (gateway / direct provider routing)
 //! - [`gateway`] - OpenAI-compatible gateway types
+//! - `telemetry` - Observability, session metrics, platform export (internal)
+//! - `control_sync` - Control-plane policy / registry sync (scaffolded, internal)
 //!
 //! ## Public vs Internal Modules
 //!
@@ -150,7 +164,7 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 ///
 /// # Example
 ///
-/// ```rust,ignore
+/// ```no_run
 /// use xybrid_core::prelude::*;
 /// ```
 pub mod prelude;
@@ -164,11 +178,12 @@ pub mod prelude;
 ///
 /// # Example
 ///
-/// ```rust,ignore
+/// ```no_run
 /// use xybrid_core::error::{XybridError, XybridResult};
 ///
 /// fn run_model() -> XybridResult<String> {
 ///     // ...
+///     # Err(XybridError::NotFound("stub".into()))
 /// }
 /// ```
 pub mod error;

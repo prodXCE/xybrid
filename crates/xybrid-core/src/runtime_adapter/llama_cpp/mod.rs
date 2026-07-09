@@ -1,7 +1,8 @@
 //! LlamaCppBackend - LLM inference using llama.cpp
 //!
 //! This module provides llama.cpp bindings for LLM inference.
-//! It is feature-gated behind `llm-llamacpp`.
+//! The whole module is feature-gated behind `llm-llamacpp`, which links
+//! the llama.cpp runtime via `llama-cpp-sys` + `xybrid-llama`.
 //!
 //! # Why llama.cpp?
 //!
@@ -21,38 +22,36 @@
 //!                     └── ggml (tensor library with runtime SIMD detection)
 //! ```
 
-mod sys;
-
-// Re-export log control functions for external use
-pub use sys::{llama_log_get_verbosity, llama_log_set_verbosity};
+// Re-export log control functions for external use. Phase 2 of the
+// `llamacpp-crate-split` epic relocated them to `xybrid_llama`; we
+// alias back to the historical `llama_log_*` names here so
+// `crate::telemetry::events` and the `runtime_adapter::mod` re-export
+// keep their existing identifiers.
+mod chat;
+mod jinja_template;
+pub use xybrid_llama::{
+    get_verbosity as llama_log_get_verbosity, set_verbosity as llama_log_set_verbosity,
+};
 
 use crate::runtime_adapter::llm::{
-    ChatMessage, GenerationConfig, GenerationOutput, LlmBackend, LlmConfig, LlmResult,
+    ChatMessage, GenerationConfig, GenerationOutput, LlmBackend, LlmConfig, LlmResult, PartialToken,
 };
-#[cfg(feature = "llm-llamacpp")]
-use crate::runtime_adapter::llm_telemetry::StreamingTelemetry;
-#[cfg(feature = "llm-llamacpp")]
+use crate::runtime_adapter::llm_telemetry::{StreamingTelemetry, StreamingTelemetryFields};
 use crate::runtime_adapter::streaming_postprocess::{
-    merge_stop_patterns, strip_thinking_tags, trim_partial_stop_suffix, truncate_at_first_stop,
-    StreamingTextFilter, CHAT_STOP_PATTERNS, CHAT_STOP_PATTERNS_BROKEN,
+    merge_stop_patterns, strip_and_capture_thinking_tags, trim_partial_stop_suffix,
+    truncate_at_first_stop, StreamingTextFilter, CHAT_STOP_PATTERNS, CHAT_STOP_PATTERNS_BROKEN,
 };
 use crate::runtime_adapter::AdapterError;
+#[cfg(feature = "llm-llamacpp-vision")]
+use crate::runtime_adapter::{MultimodalChatMessage, MultimodalMessagePart};
 use crate::tracing as xybrid_trace;
 use std::sync::Mutex;
-#[cfg(feature = "llm-llamacpp")]
-use std::sync::Once;
 
-/// Ensures llama_backend_init() is called exactly once, regardless of how many
-/// LlamaCppBackend instances are created.
-///
-/// Note: We intentionally never call llama_backend_free(). The `Once` guard
-/// cannot be re-armed, so if we freed the backend when the last instance drops
-/// and then created a new instance (e.g., during model swap), the backend
-/// would NOT be re-initialized — causing undefined behavior. Since
-/// llama_backend_free() only cleans up NUMA info (a no-op on most platforms),
-/// skipping it is safe. The OS reclaims all resources at process exit.
-#[cfg(feature = "llm-llamacpp")]
-static BACKEND_INIT: Once = Once::new();
+// Backend init is idempotent through `xybrid_llama::backend_init`; the OS
+// reclaims llama.cpp resources at process exit.
+
+#[cfg(feature = "llm-llamacpp-vision")]
+const MTMD_MEDIA_MARKER: &str = "<__media__>";
 
 /// LlamaCppBackend - LLM inference using llama.cpp.
 ///
@@ -68,23 +67,25 @@ static BACKEND_INIT: Once = Once::new();
 ///
 /// # Example
 ///
-/// ```rust,ignore
+/// ```no_run
+/// # fn _example() -> Result<(), Box<dyn std::error::Error>> {
 /// use xybrid_core::runtime_adapter::llama_cpp::LlamaCppBackend;
 /// use xybrid_core::runtime_adapter::llm::{LlmBackend, LlmConfig};
 ///
 /// let mut backend = LlamaCppBackend::new()?;
 /// backend.load(&LlmConfig::new("model.gguf"))?;
+/// # Ok(())
+/// # }
 /// ```
-#[cfg(feature = "llm-llamacpp")]
 pub struct LlamaCppBackend {
     /// Pointer to loaded model (llama_model*)
-    model: Option<sys::LlamaModel>,
+    model: Option<xybrid_llama::LlamaModel>,
     /// Pointer to context (llama_context*).
     ///
     /// Wrapped in Mutex because llama_decode() mutates internal state and is
     /// not thread-safe. The LlmBackend trait requires Send + Sync, and
     /// generate() takes &self, so we need a Mutex to serialize context access.
-    context: Mutex<Option<sys::LlamaContext>>,
+    context: Mutex<Option<xybrid_llama::LlamaContext>>,
     /// Current configuration
     config: Option<LlmConfig>,
     /// Multi-turn KV cache reuse state. Records the tokenized prompt of
@@ -95,6 +96,13 @@ pub struct LlamaCppBackend {
     /// natural critical section (we already hold the context lock when
     /// we mutate the cache via seq_rm).
     kv_state: Mutex<KvCacheState>,
+    /// Backend-owned mtmd projector context for vision-language models.
+    ///
+    /// The mtmd context references the loaded llama text model, so `Drop`,
+    /// `unload`, and model replacement always take this before dropping the
+    /// llama context/model pair.
+    #[cfg(feature = "llm-llamacpp-vision")]
+    mtmd_context: Mutex<Option<MtmdContextState>>,
 }
 
 /// Cross-call state for the multi-turn KV cache reuse path. `Default::default()`
@@ -105,7 +113,6 @@ pub struct LlamaCppBackend {
 /// to reuse — the source of truth for the future `prompt_cached_tokens`
 /// telemetry field. Read it post-`generate*` to learn how many tokens were
 /// served from cache.
-#[cfg(feature = "llm-llamacpp")]
 #[derive(Default)]
 struct KvCacheState {
     /// The exact token sequence currently sitting in the KV cache. Empty
@@ -118,37 +125,163 @@ struct KvCacheState {
     last_prefix_hit: Option<usize>,
 }
 
-#[cfg(feature = "llm-llamacpp")]
+#[cfg(feature = "llm-llamacpp-vision")]
+struct MtmdContextState {
+    mmproj_path: String,
+    _context: xybrid_llama::MtmdContext,
+}
+
+/// Bitmap payload extracted for one image part in a multimodal prompt.
+///
+/// `Encoded` carries container bytes that mtmd decodes itself (the original,
+/// unchanged single-image path). `RawRgb` carries tightly-packed RGB pixels
+/// (`width * height * 3` bytes) converted from an `ImageSource::Raw` camera
+/// frame, so the raw-frame path skips a per-frame JPEG round-trip.
+#[cfg(feature = "llm-llamacpp-vision")]
+#[derive(Debug)]
+enum MtmdPromptPayload {
+    Encoded {
+        bytes: Vec<u8>,
+    },
+    RawRgb {
+        rgb: Vec<u8>,
+        width: u32,
+        height: u32,
+    },
+}
+
+#[cfg(feature = "llm-llamacpp-vision")]
+struct MtmdPromptImage {
+    payload: MtmdPromptPayload,
+    local_id: String,
+}
+
+#[cfg(feature = "llm-llamacpp-vision")]
+impl MtmdPromptImage {
+    /// Build the mtmd bitmap for this image, selecting the encoded or raw
+    /// constructor based on how the source arrived.
+    fn build_bitmap(
+        &self,
+        mtmd_context: &xybrid_llama::MtmdContext,
+    ) -> LlmResult<xybrid_llama::MtmdBitmap> {
+        let mut bitmap = match &self.payload {
+            MtmdPromptPayload::Encoded { bytes } => {
+                xybrid_llama::MtmdBitmap::from_encoded_bytes(mtmd_context, bytes)?
+            }
+            MtmdPromptPayload::RawRgb { rgb, width, height } => {
+                xybrid_llama::MtmdBitmap::from_raw_rgb(mtmd_context, *width, *height, rgb)?
+            }
+        };
+        bitmap.set_id(&self.local_id)?;
+        Ok(bitmap)
+    }
+}
+
+#[cfg(feature = "llm-llamacpp-vision")]
+struct MtmdPromptInputs {
+    chat_messages: Vec<ChatMessage>,
+    images: Vec<MtmdPromptImage>,
+}
+
+#[cfg(feature = "llm-llamacpp-vision")]
+fn mtmd_prompt_inputs_from_messages(
+    messages: &[MultimodalChatMessage],
+) -> LlmResult<MtmdPromptInputs> {
+    let mut chat_messages = Vec::with_capacity(messages.len());
+    let mut images = Vec::new();
+
+    for message in messages {
+        let content = message.marker_prompt(MTMD_MEDIA_MARKER)?;
+        chat_messages.push(ChatMessage {
+            role: message.role,
+            content,
+        });
+
+        for part in &message.parts {
+            let MultimodalMessagePart::Image(image) = part else {
+                continue;
+            };
+            let payload = if let Some((bytes, _format)) = image.source.as_encoded() {
+                // Encoded path (unchanged): mtmd decodes the container bytes.
+                MtmdPromptPayload::Encoded {
+                    bytes: bytes.to_vec(),
+                }
+            } else if let Some(raw) = image.source.as_raw() {
+                // Raw path: strip stride/alpha (and convert YUV→RGB) into the
+                // tightly-packed RGB layout mtmd_bitmap_init expects, skipping
+                // the per-frame JPEG round-trip.
+                let rgb = crate::execution::preprocessing::image::raw_image_to_packed_rgb(raw)?;
+                MtmdPromptPayload::RawRgb {
+                    rgb,
+                    width: raw.dimensions.width,
+                    height: raw.dimensions.height,
+                }
+            } else {
+                return Err(AdapterError::InvalidInput(
+                    "llama.cpp mtmd requires encoded or raw image bytes".to_string(),
+                ));
+            };
+            images.push(MtmdPromptImage {
+                payload,
+                local_id: image.local_id.clone(),
+            });
+        }
+    }
+
+    Ok(MtmdPromptInputs {
+        chat_messages,
+        images,
+    })
+}
+
+fn emit_filtered_partial_token(
+    filter: &mut StreamingTextFilter,
+    token_id: i32,
+    token_text: &str,
+    token_index: &mut usize,
+    on_token: &mut crate::runtime_adapter::llm::StreamingCallback<'_>,
+) -> Result<(), crate::runtime_adapter::llm::StreamingError> {
+    if let Some(safe_text) = filter.push(token_text) {
+        let partial = PartialToken::new(
+            safe_text,
+            *token_index,
+            filter.cumulative_emitted().to_string(),
+        )
+        .with_token_id(token_id as i64);
+        *token_index += 1;
+        on_token(partial)?;
+    }
+
+    Ok(())
+}
+
 impl LlamaCppBackend {
     /// Create a new LlamaCppBackend.
     pub fn new() -> LlmResult<Self> {
-        // Initialize llama.cpp backend exactly once (idempotent via Once).
-        BACKEND_INIT.call_once(|| {
-            sys::llama_backend_init();
-
-            // Check for verbosity env var to surface C++ logs during debugging
-            if let Ok(level) = std::env::var("XYBRID_LLAMACPP_VERBOSITY") {
-                if let Ok(v) = level.parse::<i32>() {
-                    sys::llama_log_set_verbosity(v);
-                }
-            }
-        });
+        // Initialize llama.cpp backend exactly once through the safe wrapper.
+        // The wrapper keeps Xybrid's log-policy hook paired with native
+        // backend init while leaving the `-sys` crate policy-free.
+        xybrid_llama::backend_init();
 
         Ok(Self {
             model: None,
             context: Mutex::new(None),
             config: None,
             kv_state: Mutex::new(KvCacheState::default()),
+            #[cfg(feature = "llm-llamacpp-vision")]
+            mtmd_context: Mutex::new(None),
         })
     }
 }
 
-#[cfg(feature = "llm-llamacpp")]
 impl Drop for LlamaCppBackend {
     fn drop(&mut self) {
-        // Drop context first, then model (order matters: context references model).
+        // Drop mtmd first, then context, then model (order matters: both mtmd
+        // and llama context reference the model).
         // LlamaContext and LlamaModel implement Drop, so take() + drop handles cleanup.
         // get_mut() doesn't lock — safe because Drop has &mut self.
+        #[cfg(feature = "llm-llamacpp-vision")]
+        let _ = self.mtmd_context.get_mut().unwrap().take(); // drops MtmdContext
         let _ = self.context.get_mut().unwrap().take(); // drops LlamaContext
         let _ = self.model.take(); // drops LlamaModel
 
@@ -157,14 +290,12 @@ impl Drop for LlamaCppBackend {
     }
 }
 
-#[cfg(feature = "llm-llamacpp")]
 impl Default for LlamaCppBackend {
     fn default() -> Self {
         Self::new().expect("Failed to create LlamaCppBackend")
     }
 }
 
-#[cfg(feature = "llm-llamacpp")]
 impl LlamaCppBackend {
     /// Acquire the model + context under the context mutex and hand both
     /// to `f`. Replaces three copies of the same five-line dance across
@@ -174,7 +305,7 @@ impl LlamaCppBackend {
     /// across threads is required.
     fn with_model_and_context<R, F>(&self, f: F) -> LlmResult<R>
     where
-        F: FnOnce(&sys::LlamaModel, &sys::LlamaContext) -> LlmResult<R>,
+        F: FnOnce(&xybrid_llama::LlamaModel, &xybrid_llama::LlamaContext) -> LlmResult<R>,
     {
         let model = self.model.as_ref().ok_or_else(|| {
             AdapterError::ModelNotLoaded("No model loaded. Call load() first.".to_string())
@@ -193,7 +324,7 @@ impl LlamaCppBackend {
     /// the new prompt's tokens and what's already in the cache from the
     /// previous call, truncate the cache to that prefix, and return the
     /// diverged tail along with the prefix length the caller should pass
-    /// as `n_past_in` to [`sys::llama_generate_streaming`].
+    /// as `n_past_in` to [`xybrid_llama::generate_streaming`].
     ///
     /// On a fresh context (no prior call) or when the prompts share no
     /// prefix, returns `(full_tokens, 0)` and full-clears the cache so the
@@ -213,8 +344,8 @@ impl LlamaCppBackend {
     /// accessor [`Self::last_cached_prefix_len`].
     fn prepare_kv_cache_and_get_tail(
         &self,
-        model: &sys::LlamaModel,
-        context: &sys::LlamaContext,
+        model: &xybrid_llama::LlamaModel,
+        context: &xybrid_llama::LlamaContext,
         new_tokens: &[i32],
         max_new_tokens: usize,
     ) -> LlmResult<(Vec<i32>, usize)> {
@@ -240,14 +371,14 @@ impl LlamaCppBackend {
         // fall back to the pre-INF-99 full-clear path. The cost is
         // per-turn re-prefill of the full conversation — correct, just
         // not the prefix-reuse optimisation.
-        if sys::llama_model_has_recurrent_state(model) {
-            sys::llama_kv_cache_clear(context);
+        if model.has_recurrent_state() {
+            context.kv_cache_clear();
             state.cached_tokens = new_tokens.to_vec();
             state.last_prefix_hit = Some(0);
             return Ok((new_tokens.to_vec(), 0));
         }
 
-        let n_ctx = sys::llama_n_ctx(context);
+        let n_ctx = context.n_ctx();
         let prefix_len = compute_reusable_prefix_len(&state.cached_tokens, new_tokens);
 
         // Safety net: if the prefilled prefix + new tail + max_new_tokens
@@ -260,7 +391,7 @@ impl LlamaCppBackend {
             .saturating_add(max_new_tokens)
             >= n_ctx;
         if prefix_len == 0 || would_overflow {
-            sys::llama_kv_cache_clear(context);
+            context.kv_cache_clear();
             state.cached_tokens = new_tokens.to_vec();
             state.last_prefix_hit = Some(0);
             return Ok((new_tokens.to_vec(), 0));
@@ -270,15 +401,15 @@ impl LlamaCppBackend {
         // wrapper's batch.seq_id[..][0] = 0 path uses a single sequence;
         // when we add multi-sequence support the seq_id needs to flow
         // through prepare too.
-        sys::llama_kv_cache_seq_rm(context, 0, prefix_len);
+        context.kv_cache_seq_rm(0, prefix_len);
         let tail = new_tokens[prefix_len..].to_vec();
         state.cached_tokens = new_tokens.to_vec();
         state.last_prefix_hit = Some(prefix_len);
         Ok((tail, prefix_len))
     }
 
-    fn reset_kv_cache_after_failed_stream(&self, context: &sys::LlamaContext) {
-        sys::llama_kv_cache_clear(context);
+    fn reset_kv_cache_after_failed_stream(&self, context: &xybrid_llama::LlamaContext) {
+        context.kv_cache_clear();
         self.clear_cached_prefix_state();
     }
 
@@ -287,6 +418,239 @@ impl LlamaCppBackend {
             *state = KvCacheState::default();
         }
     }
+
+    #[cfg(feature = "llm-llamacpp-vision")]
+    fn ensure_mtmd_context_loaded_with<F>(&self, mmproj_path: &str, loader: F) -> LlmResult<bool>
+    where
+        F: FnOnce(&str) -> LlmResult<xybrid_llama::MtmdContext>,
+    {
+        let (loaded, ()) = self.with_mtmd_context_loaded_with(mmproj_path, loader, |_| Ok(()))?;
+        Ok(loaded)
+    }
+
+    #[cfg(feature = "llm-llamacpp-vision")]
+    fn with_mtmd_context_loaded_with<F, G, R>(
+        &self,
+        mmproj_path: &str,
+        loader: F,
+        f: G,
+    ) -> LlmResult<(bool, R)>
+    where
+        F: FnOnce(&str) -> LlmResult<xybrid_llama::MtmdContext>,
+        G: FnOnce(&xybrid_llama::MtmdContext) -> LlmResult<R>,
+    {
+        let mut guard = self
+            .mtmd_context
+            .lock()
+            .map_err(|_| AdapterError::RuntimeError("mtmd context mutex poisoned".to_string()))?;
+
+        let mut loaded = false;
+        if let Some(state) = guard.as_ref() {
+            if state.mmproj_path == mmproj_path {
+                let result = f(&state._context)?;
+                return Ok((loaded, result));
+            }
+        }
+
+        let context = loader(mmproj_path)?;
+        *guard = Some(MtmdContextState {
+            mmproj_path: mmproj_path.to_string(),
+            _context: context,
+        });
+        loaded = true;
+
+        let state = guard.as_ref().ok_or_else(|| {
+            AdapterError::RuntimeError("mtmd context missing after load".to_string())
+        })?;
+        let result = f(&state._context)?;
+        Ok((loaded, result))
+    }
+
+    #[cfg(feature = "llm-llamacpp-vision")]
+    fn with_mtmd_context_loaded<G, R>(
+        &self,
+        model: &xybrid_llama::LlamaModel,
+        mmproj_path: &str,
+        f: G,
+    ) -> LlmResult<(bool, R)>
+    where
+        G: FnOnce(&xybrid_llama::MtmdContext) -> LlmResult<R>,
+    {
+        let config = self.config.as_ref().ok_or_else(|| {
+            AdapterError::ModelNotLoaded("No config. Call load() first.".to_string())
+        })?;
+        let use_gpu = config.gpu_layers != 0;
+        let warmup = false;
+        let n_threads = config.n_threads;
+        let flash_attn = config.flash_attn;
+
+        self.with_mtmd_context_loaded_with(
+            mmproj_path,
+            |path| {
+                xybrid_llama::MtmdContext::from_file(
+                    path, model, use_gpu, warmup, n_threads, flash_attn,
+                )
+                .map_err(AdapterError::from)
+            },
+            f,
+        )
+    }
+
+    /// Whether the loaded model is a reasoning ("thinking") model — drives
+    /// `<think>`-channel priming and the streaming filter's primed mode.
+    fn reasoning_enabled(&self) -> bool {
+        self.config.as_ref().map(|c| c.reasoning).unwrap_or(false)
+    }
+
+    fn tokenize_chat_prompt(
+        model: &xybrid_llama::LlamaModel,
+        messages: &[ChatMessage],
+        reasoning: bool,
+        tools: &[crate::gateway::Tool],
+    ) -> LlmResult<Vec<i32>> {
+        let prompt = chat::format_chat_prompt(model, messages, reasoning, tools)?;
+        Ok(model.tokenize_special(&prompt, true)?)
+    }
+
+    fn tokenize_raw_prompt(model: &xybrid_llama::LlamaModel, prompt: &str) -> LlmResult<Vec<i32>> {
+        Ok(model.tokenize_special(prompt, true)?)
+    }
+
+    fn prepare_generation(
+        &self,
+        model: &xybrid_llama::LlamaModel,
+        context: &xybrid_llama::LlamaContext,
+        tokens: Vec<i32>,
+        config: &GenerationConfig,
+        prompt_kind: PromptKind,
+    ) -> LlmResult<PreparedGeneration> {
+        let n_ctx = context.n_ctx();
+        if tokens.len() >= n_ctx {
+            return Err(AdapterError::InvalidInput(
+                prompt_kind.input_too_long_message(tokens.len(), n_ctx),
+            ));
+        }
+
+        let prompt_token_count = tokens.len();
+        let (tail, n_past) =
+            self.prepare_kv_cache_and_get_tail(model, context, &tokens, config.max_tokens)?;
+
+        Ok(PreparedGeneration {
+            prompt_token_count,
+            tail,
+            n_past,
+        })
+    }
+
+    fn run_streaming_generation<F>(
+        context: &xybrid_llama::LlamaContext,
+        model: &xybrid_llama::LlamaModel,
+        prepared: &PreparedGeneration,
+        config: &GenerationConfig,
+        stop_sequences: &[String],
+        mut on_chunk: F,
+    ) -> LlmResult<(Vec<i32>, bool, StreamingTelemetryFields)>
+    where
+        F: FnMut(
+            i32,
+            &str,
+            &mut StreamingTelemetry,
+        ) -> Result<(), crate::runtime_adapter::llm::StreamingError>,
+    {
+        xybrid_trace::add_metadata("tokens_in", prepared.prompt_token_count.to_string());
+        let mut tel = StreamingTelemetry::new(prepared.prompt_token_count);
+        let (output_tokens, stopped_by_callback) = xybrid_llama::generate_streaming(
+            context,
+            model,
+            &prepared.tail,
+            config.max_tokens,
+            config.temperature,
+            config.top_p,
+            config.min_p,
+            config.top_k,
+            config.repetition_penalty,
+            stop_sequences,
+            config.grammar.as_deref(),
+            |token_id, token_text| on_chunk(token_id, token_text, &mut tel),
+            prepared.n_past,
+        )?;
+        let fields = tel.finalize(output_tokens.len());
+        Ok((output_tokens, stopped_by_callback, fields))
+    }
+}
+
+struct PreparedGeneration {
+    prompt_token_count: usize,
+    tail: Vec<i32>,
+    n_past: usize,
+}
+
+enum PromptKind {
+    Chat,
+    Raw,
+}
+
+impl PromptKind {
+    fn input_too_long_message(&self, tokens_len: usize, n_ctx: usize) -> String {
+        match self {
+            Self::Chat => format!(
+                "Input too long: {} tokens exceeds context window of {} tokens. \
+                     Reduce the prompt size or conversation history.",
+                tokens_len, n_ctx
+            ),
+            Self::Raw => format!(
+                "Input too long: {} tokens exceeds context window of {} tokens.",
+                tokens_len, n_ctx
+            ),
+        }
+    }
+}
+
+fn output_from_fields(
+    text: String,
+    tokens_generated: usize,
+    finish_reason: String,
+    reasoning_content: Option<String>,
+    fields: StreamingTelemetryFields,
+) -> GenerationOutput {
+    GenerationOutput {
+        text,
+        tokens_generated,
+        generation_time_ms: fields.generation_time_ms,
+        tokens_per_second: fields.tokens_per_second,
+        finish_reason,
+        ttft_ms: fields.ttft_ms,
+        mean_itl_ms: fields.mean_itl_ms,
+        p95_itl_ms: fields.p95_itl_ms,
+        emitted_chunks: fields.emitted_chunks,
+        inter_chunk_ms: fields.inter_chunk_ms,
+        decode_tps: fields.decode_tps,
+        prefill_tps: fields.prefill_tps,
+        image_preprocess_ms: None,
+        reasoning_content,
+    }
+}
+
+/// Assemble the final-cleanup stop patterns for a chat turn: the caller's
+/// configured stops plus the built-in [`CHAT_STOP_PATTERNS`] and their
+/// `_BROKEN` variants. Shared by `generate` and `generate_streaming` so the
+/// pattern set cannot drift between the streaming and non-streaming paths.
+fn chat_stop_patterns(config: &GenerationConfig) -> Vec<String> {
+    let mut extras: Vec<&str> = CHAT_STOP_PATTERNS.to_vec();
+    extras.extend_from_slice(CHAT_STOP_PATTERNS_BROKEN);
+    merge_stop_patterns(&config.stop_sequences, &extras)
+}
+
+/// Observation-only streaming chunk handler for the non-streaming
+/// `generate` / `generate_raw` paths: records per-chunk telemetry and emits
+/// nothing to the caller. Shared so the two call sites can't drift.
+fn record_only(
+    _token_id: i32,
+    _token_text: &str,
+    tel: &mut StreamingTelemetry,
+) -> Result<(), crate::runtime_adapter::llm::StreamingError> {
+    tel.record_chunk();
+    Ok(())
 }
 
 /// Longest-common-prefix length between the cached tokens and the new
@@ -299,7 +663,6 @@ impl LlamaCppBackend {
 /// - empty `cached` ⇒ 0 (first call)
 /// - identical sequences ⇒ `new_tokens.len() - 1` (keep last token for the C decoder)
 /// - common prefix shorter than either ⇒ that prefix length
-#[cfg(feature = "llm-llamacpp")]
 fn compute_reusable_prefix_len(cached: &[i32], new_tokens: &[i32]) -> usize {
     let max_reuse = new_tokens.len().saturating_sub(1);
     cached
@@ -310,7 +673,6 @@ fn compute_reusable_prefix_len(cached: &[i32], new_tokens: &[i32]) -> usize {
         .count()
 }
 
-#[cfg(feature = "llm-llamacpp")]
 impl LlmBackend for LlamaCppBackend {
     fn name(&self) -> &str {
         "llama-cpp"
@@ -330,6 +692,15 @@ impl LlmBackend for LlamaCppBackend {
         let model_path = Path::new(&config.model_path);
         if !model_path.exists() {
             return Err(AdapterError::ModelNotFound(config.model_path.clone()));
+        }
+        if let Some(vision_encoder_path) = &config.vision_encoder_path {
+            let path = Path::new(vision_encoder_path);
+            if !path.exists() {
+                return Err(AdapterError::MissingArtifact {
+                    artifact: "vision_encoder".to_string(),
+                    path: vision_encoder_path.clone(),
+                });
+            }
         }
 
         // Find the GGUF file
@@ -359,21 +730,20 @@ impl LlmBackend for LlamaCppBackend {
         };
 
         // Load model
-        let model =
-            sys::llama_load_model_from_file(&gguf_path, config.gpu_layers).map_err(|e| {
-                AdapterError::RuntimeError(format!(
-                    "Failed to load model from {}: {}. \
+        let model = xybrid_llama::LlamaModel::load(&gguf_path, config.gpu_layers).map_err(|e| {
+            AdapterError::RuntimeError(format!(
+                "Failed to load model from {}: {}. \
                  This may indicate an unsupported GGUF architecture — \
                  check that the vendored llama.cpp version supports this model's architecture. \
                  Enable verbose logging with XYBRID_LLAMACPP_VERBOSITY=4 for C++ error details.",
-                    gguf_path, e
-                ))
-            })?;
+                gguf_path, e
+            ))
+        })?;
 
         // Create context with thread and batch configuration
         // n_threads=0 means auto-detect in the C++ layer
         // n_batch=0 means use default (512)
-        let context = sys::llama_new_context_with_model(
+        let context = xybrid_llama::LlamaContext::new(
             &model,
             config.context_length,
             config.n_threads,
@@ -382,20 +752,34 @@ impl LlmBackend for LlamaCppBackend {
         )
         .map_err(|e| AdapterError::RuntimeError(format!("Failed to create context: {}", e)))?;
 
+        #[cfg(feature = "llm-llamacpp-vision")]
+        let _ = self.mtmd_context.get_mut().unwrap().take();
+        let _ = self.context.get_mut().unwrap().take();
+        let _ = self.model.take();
+
         self.model = Some(model);
         *self.context.get_mut().unwrap() = Some(context);
         self.config = Some(config.clone());
+        *self.kv_state.get_mut().unwrap() = KvCacheState::default();
 
         Ok(())
     }
 
     fn is_loaded(&self) -> bool {
-        self.model.is_some() && self.context.lock().unwrap().is_some()
+        // A poisoned context lock means an interrupted `llama_decode` may have
+        // left the `LlamaContext` inconsistent, so treat it as "not safely
+        // loaded" rather than panicking on `unwrap`. Matches the graceful
+        // `.ok()` degradation used elsewhere in this backend (e.g.
+        // `last_cached_prefix_len`) instead of `into_inner()` recovery, because
+        // the guarded context must not be reused once poisoned.
+        self.model.is_some() && self.context.lock().map(|c| c.is_some()).unwrap_or(false)
     }
 
     fn unload(&mut self) -> LlmResult<()> {
-        // Drop context first, then model (order matters).
+        // Drop mtmd first, then context, then model (order matters).
         // LlamaContext and LlamaModel implement Drop, so take() handles cleanup.
+        #[cfg(feature = "llm-llamacpp-vision")]
+        let _ = self.mtmd_context.get_mut().unwrap().take();
         let _ = self.context.get_mut().unwrap().take();
         let _ = self.model.take();
         self.config = None;
@@ -412,82 +796,44 @@ impl LlmBackend for LlamaCppBackend {
         config: &GenerationConfig,
     ) -> LlmResult<GenerationOutput> {
         self.with_model_and_context(|model, context| {
-            // Format messages into prompt using chat template
-            let prompt = sys::llama_format_chat(model, messages)?;
-
             // Tokenize with special token parsing enabled — the chat template contains
             // special tokens like <|im_start|>, <end_of_turn>, etc. that must be
             // recognized as their special token IDs, not as individual characters.
-            let tokens = sys::llama_tokenize_special(model, &prompt, true)?;
-
-            // Validate: input tokens must fit within the context window with room to generate
-            let n_ctx = sys::llama_n_ctx(context);
-            if tokens.len() >= n_ctx {
-                return Err(AdapterError::InvalidInput(format!(
-                    "Input too long: {} tokens exceeds context window of {} tokens. \
-                     Reduce the prompt size or conversation history.",
-                    tokens.len(),
-                    n_ctx
-                )));
-            }
-
-            // Multi-turn KV cache reuse: keep the prefix the previous call
-            // already prefilled, only re-prefill the diverged tail. On a
-            // first turn (or no shared prefix) `tail == tokens` and
-            // `n_past == 0` — same observable behaviour as the legacy
-            // unconditional clear, just without the duplicate work in
-            // multi-turn chats.
-            let (tail, n_past) =
-                self.prepare_kv_cache_and_get_tail(model, context, &tokens, config.max_tokens)?;
+            let tokens = Self::tokenize_chat_prompt(
+                model,
+                messages,
+                self.reasoning_enabled(),
+                &config.tools,
+            )?;
+            let prepared =
+                self.prepare_generation(model, context, tokens, config, PromptKind::Chat)?;
 
             // Per-chunk timestamps capture the streaming cadence for TTFT +
             // inter-token-latency telemetry. The closure is observation-only
             // (no external emission) — generation still returns the full
             // token vector like `llama_generate_with_stops` did. Keeps the
             // non-streaming contract of this function intact.
-            // Capture prompt size up-front so we can attach `tokens_in` to
-            // the active span after the loop. The executor opens
-            // `llm_inference_streaming` around this call, so this metadata
-            // lands on the same span as the rest of the LLM telemetry that
-            // `mirror_llm_metrics_to_span` writes post-return.
-            let prompt_token_count = tokens.len();
             // Surface prompt size on the active span BEFORE the streaming
             // loop, so cloud-fallback aborts (which short-circuit before
             // tel.finalize runs) still attach tokens_in to LocalAborted.
             // Without this the dashboard's TOKENS column shows `—` for the
             // local leg of every aborted run. Successful runs harmlessly
             // overwrite this with the same value after finalize.
-            xybrid_trace::add_metadata("tokens_in", prompt_token_count.to_string());
-            let mut tel = StreamingTelemetry::new(prompt_token_count);
-            let stream_result = sys::llama_generate_streaming(
+            let stream_result = Self::run_streaming_generation(
                 context,
                 model,
-                &tail,
-                config.max_tokens,
-                config.temperature,
-                config.top_p,
-                config.min_p,
-                config.top_k,
-                config.repetition_penalty,
+                &prepared,
+                config,
                 &config.stop_sequences,
-                |_token_id, _token_text| {
-                    tel.record_chunk();
-                    Ok(())
-                },
-                n_past,
+                record_only,
             );
-            let (output_tokens, stopped_by_callback) = match stream_result {
+            let (output_tokens, stopped_by_callback, fields) = match stream_result {
                 Ok(result) => result,
                 Err(err) => {
                     self.reset_kv_cache_after_failed_stream(context);
                     return Err(err);
                 }
             };
-
-            // Finalize telemetry before the post-processing work below so
-            // `generation_time_ms` reflects pure generation wallclock and is
-            // not inflated by detokenization / stop-sequence scanning.
-            let fields = tel.finalize(output_tokens.len());
 
             // Log generated token count and last few tokens for debugging
             log::debug!(
@@ -498,7 +844,7 @@ impl LlmBackend for LlamaCppBackend {
             );
 
             // Decode tokens to text
-            let mut text = sys::llama_detokenize(model, &output_tokens)?;
+            let mut text = model.detokenize(&output_tokens)?;
 
             // Debug: log the raw text and its bytes to understand encoding
             log::debug!(target: "xybrid_core", "LLM raw output ({} chars): {:?}", text.len(), &text[..text.len().min(200)]);
@@ -508,20 +854,18 @@ impl LlmBackend for LlamaCppBackend {
             // `streaming_postprocess`. The `*_BROKEN` patterns cover
             // tokenizers that split the leading `<` off a chat-template
             // marker — safe only for final-text cleanup, not streaming.
-            let final_stop_patterns = {
-                let mut extras: Vec<&str> = CHAT_STOP_PATTERNS.to_vec();
-                extras.extend_from_slice(CHAT_STOP_PATTERNS_BROKEN);
-                merge_stop_patterns(&config.stop_sequences, &extras)
-            };
+            let final_stop_patterns = chat_stop_patterns(config);
             log::debug!(target: "xybrid_core", "Searching for stop patterns: {:?}", final_stop_patterns);
             let stopped_in_text = truncate_at_first_stop(&mut text, &final_stop_patterns);
-            let text = strip_thinking_tags(&text).trim().to_string();
+            let trimmed_partial = trim_partial_stop_suffix(&mut text, &final_stop_patterns);
+            let (clean, reasoning_content) = strip_and_capture_thinking_tags(&text);
+            let text = clean.trim().to_string();
             // `stopped_by_callback` catches the C layer detecting a stop
             // before the Rust post-scan would — e.g. the user-supplied
             // stop sequences that the C layer sees first. Prior code
             // silently dropped this signal and sometimes reported
             // `length` for a clean stop.
-            let finish_reason = if stopped_in_text || stopped_by_callback {
+            let finish_reason = if stopped_in_text || trimmed_partial || stopped_by_callback {
                 "stop"
             } else {
                 "length"
@@ -534,20 +878,13 @@ impl LlmBackend for LlamaCppBackend {
             // `llama_perf_context`'s `t_p_eval_ms` / `t_eval_ms`, so the
             // numbers are derived from per-chunk timestamps. See
             // `compute_streaming_fields` for formula semantics.
-            Ok(GenerationOutput {
+            Ok(output_from_fields(
                 text,
-                tokens_generated: output_tokens.len(),
-                generation_time_ms: fields.generation_time_ms,
-                tokens_per_second: fields.tokens_per_second,
+                output_tokens.len(),
                 finish_reason,
-                ttft_ms: fields.ttft_ms,
-                mean_itl_ms: fields.mean_itl_ms,
-                p95_itl_ms: fields.p95_itl_ms,
-                emitted_chunks: fields.emitted_chunks,
-                inter_chunk_ms: fields.inter_chunk_ms,
-                decode_tps: fields.decode_tps,
-                prefill_tps: fields.prefill_tps,
-            })
+                reasoning_content,
+                fields,
+            ))
         })
     }
 
@@ -558,58 +895,30 @@ impl LlmBackend for LlamaCppBackend {
             // collapse to single vocab IDs instead of 8-10 subword pieces each.
             // Matches llama-cpp-python's Llama.__call__ default (special=True),
             // which is required for NeuTTS-style codec TTS models.
-            let tokens = sys::llama_tokenize_special(model, prompt, true)?;
-
-            let n_ctx = sys::llama_n_ctx(context);
-            if tokens.len() >= n_ctx {
-                return Err(AdapterError::InvalidInput(format!(
-                    "Input too long: {} tokens exceeds context window of {} tokens.",
-                    tokens.len(),
-                    n_ctx
-                )));
-            }
-
-            // Multi-turn KV cache reuse: see prepare_kv_cache_and_get_tail
-            // for the LCP + truncate-or-clear contract. raw-prompt callers
-            // (TTS codec preludes etc.) typically don't share prefixes
-            // across calls so the LCP path will mostly clear-and-refill,
-            // but the unified helper keeps behaviour consistent.
-            let (tail, n_past) =
-                self.prepare_kv_cache_and_get_tail(model, context, &tokens, config.max_tokens)?;
+            let tokens = Self::tokenize_raw_prompt(model, prompt)?;
+            let prepared =
+                self.prepare_generation(model, context, tokens, config, PromptKind::Raw)?;
 
             // Use the streaming-capable API with an observation-only
             // callback so raw generation gets the same TTFT / ITL /
             // decode-tps telemetry as `generate()`. Stop handling stays
             // raw — only user-supplied sequences, no chat markers.
-            let prompt_token_count = tokens.len();
             // Surface prompt size on the active span BEFORE the streaming
             // loop, so cloud-fallback aborts (which short-circuit before
             // tel.finalize runs) still attach tokens_in to LocalAborted.
             // Without this the dashboard's TOKENS column shows `—` for the
             // local leg of every aborted run. Successful runs harmlessly
             // overwrite this with the same value after finalize.
-            xybrid_trace::add_metadata("tokens_in", prompt_token_count.to_string());
-            let mut tel = StreamingTelemetry::new(prompt_token_count);
-            let (output_tokens, stopped_by_callback) = sys::llama_generate_streaming(
+            let (output_tokens, stopped_by_callback, fields) = Self::run_streaming_generation(
                 context,
                 model,
-                &tail,
-                config.max_tokens,
-                config.temperature,
-                config.top_p,
-                config.min_p,
-                config.top_k,
-                config.repetition_penalty,
+                &prepared,
+                config,
                 &config.stop_sequences,
-                |_token_id, _token_text| {
-                    tel.record_chunk();
-                    Ok(())
-                },
-                n_past,
+                record_only,
             )?;
-            let fields = tel.finalize(output_tokens.len());
 
-            let text = sys::llama_detokenize(model, &output_tokens)?;
+            let text = model.detokenize(&output_tokens)?;
             let text = text.trim().to_string();
             let finish_reason = if stopped_by_callback {
                 "stop"
@@ -618,21 +927,31 @@ impl LlmBackend for LlamaCppBackend {
             }
             .to_string();
 
-            Ok(GenerationOutput {
+            // Raw-prompt path: no chat template, so no `<think>` blocks to
+            // surface. Reasoning is always absent here.
+            Ok(output_from_fields(
                 text,
-                tokens_generated: output_tokens.len(),
-                generation_time_ms: fields.generation_time_ms,
-                tokens_per_second: fields.tokens_per_second,
+                output_tokens.len(),
                 finish_reason,
-                ttft_ms: fields.ttft_ms,
-                mean_itl_ms: fields.mean_itl_ms,
-                p95_itl_ms: fields.p95_itl_ms,
-                emitted_chunks: fields.emitted_chunks,
-                inter_chunk_ms: fields.inter_chunk_ms,
-                decode_tps: fields.decode_tps,
-                prefill_tps: fields.prefill_tps,
-            })
+                None,
+                fields,
+            ))
         })
+    }
+
+    fn render_chat_prompt(
+        &self,
+        messages: &[ChatMessage],
+        config: &GenerationConfig,
+    ) -> LlmResult<String> {
+        // Rendering needs only the model (embedded template + tokenizer
+        // metadata), not the decode context — so read the model directly
+        // instead of going through `with_model_and_context`, and never
+        // queue behind an in-flight generation holding the context mutex.
+        let model = self.model.as_ref().ok_or_else(|| {
+            AdapterError::ModelNotLoaded("No model loaded. Call load() first.".to_string())
+        })?;
+        chat::format_chat_prompt(model, messages, self.reasoning_enabled(), &config.tools)
     }
 
     fn generate_streaming(
@@ -641,32 +960,18 @@ impl LlmBackend for LlamaCppBackend {
         config: &GenerationConfig,
         on_token: crate::runtime_adapter::llm::StreamingCallback<'_>,
     ) -> LlmResult<GenerationOutput> {
-        use crate::runtime_adapter::llm::PartialToken;
         let mut on_token = on_token;
 
         self.with_model_and_context(|model, context| {
-            // Format messages into prompt using chat template
-            let prompt = sys::llama_format_chat(model, messages)?;
-
             // Tokenize with special token parsing — chat template contains special tokens
-            let tokens = sys::llama_tokenize_special(model, &prompt, true)?;
-
-            // Validate: input tokens must fit within the context window with room to generate
-            let n_ctx = sys::llama_n_ctx(context);
-            if tokens.len() >= n_ctx {
-                return Err(AdapterError::InvalidInput(format!(
-                    "Input too long: {} tokens exceeds context window of {} tokens. \
-                     Reduce the prompt size or conversation history.",
-                    tokens.len(),
-                    n_ctx
-                )));
-            }
-
-            // Multi-turn KV cache reuse: keep the prefix the previous call
-            // already prefilled, only re-prefill the diverged tail. See
-            // prepare_kv_cache_and_get_tail for the full contract.
-            let (tail, n_past) =
-                self.prepare_kv_cache_and_get_tail(model, context, &tokens, config.max_tokens)?;
+            let tokens = Self::tokenize_chat_prompt(
+                model,
+                messages,
+                self.reasoning_enabled(),
+                &config.tools,
+            )?;
+            let prepared =
+                self.prepare_generation(model, context, tokens, config, PromptKind::Chat)?;
 
             // Shared streaming state: telemetry recorder + text filter.
             // The filter owns cumulative text, think-block state, stop-pattern
@@ -679,31 +984,34 @@ impl LlmBackend for LlamaCppBackend {
             // `_BROKEN` variants are intentionally excluded from streaming
             // (they false-positive on legitimate text) — they only run in
             // the final cleanup pass below.
-            let prompt_token_count = tokens.len();
             // Surface prompt size on the active span BEFORE the streaming
             // loop, so cloud-fallback aborts (which short-circuit before
             // tel.finalize runs) still attach tokens_in to LocalAborted.
             // Without this the dashboard's TOKENS column shows `—` for the
             // local leg of every aborted run. Successful runs harmlessly
             // overwrite this with the same value after finalize.
-            xybrid_trace::add_metadata("tokens_in", prompt_token_count.to_string());
-            let mut tel = StreamingTelemetry::new(prompt_token_count);
             let stop_patterns = merge_stop_patterns(&config.stop_sequences, CHAT_STOP_PATTERNS);
-            let mut filter = StreamingTextFilter::new(stop_patterns.clone());
+            let suppress_tools = !config.tools.is_empty();
+            // Thinking models have `<think>` primed into the prompt, so their
+            // output starts mid-reasoning with no opening tag — start the filter
+            // already suppressing so the reasoning never reaches the callback.
+            let mut filter = if self.reasoning_enabled() {
+                StreamingTextFilter::new_reasoning_primed(stop_patterns.clone())
+            } else {
+                StreamingTextFilter::new(stop_patterns.clone())
+            };
+            if suppress_tools {
+                filter = filter.with_tool_call_suppression();
+            }
             let mut token_index = 0usize;
 
-            let (output_tokens, stopped_by_callback) = sys::llama_generate_streaming(
+            let (output_tokens, stopped_by_callback, fields) = Self::run_streaming_generation(
                 context,
                 model,
-                &tail,
-                config.max_tokens,
-                config.temperature,
-                config.top_p,
-                config.min_p,
-                config.top_k,
-                config.repetition_penalty,
+                &prepared,
+                config,
                 &stop_patterns, // C layer uses these for early stop / llama_vocab_is_eog
-                |token_id, token_text| {
+                |token_id, token_text, tel| {
                     // Timestamp every C-layer callback, before any filtering —
                     // the stream itself is what's being measured, not the
                     // user-visible emission.
@@ -722,14 +1030,7 @@ impl LlmBackend for LlamaCppBackend {
 
                     Ok(())
                 },
-                n_past,
             )?;
-
-            // Finalize telemetry before post-processing so `generation_time_ms`
-            // reflects only the generation loop, not detokenization or
-            // stop-pattern cleanup. Shared with `generate()` — see
-            // `compute_streaming_fields`.
-            let fields = tel.finalize(output_tokens.len());
 
             // Final-output cleanup: detokenize the full token vector (rather
             // than using the filter's cumulative text) as a belt-and-braces
@@ -738,49 +1039,58 @@ impl LlmBackend for LlamaCppBackend {
             // non-streaming path. The `_BROKEN` fallback patterns are
             // included here because this is final-text only — no streaming
             // false-positive risk.
-            let final_patterns = {
-                let mut extras: Vec<&str> = CHAT_STOP_PATTERNS.to_vec();
-                extras.extend_from_slice(CHAT_STOP_PATTERNS_BROKEN);
-                merge_stop_patterns(&config.stop_sequences, &extras)
-            };
-            let mut text = sys::llama_detokenize(model, &output_tokens)?;
+            let final_patterns = chat_stop_patterns(config);
+            let mut text = model.detokenize(&output_tokens)?;
             let stopped_full = truncate_at_first_stop(&mut text, &final_patterns);
             let trimmed_partial = trim_partial_stop_suffix(&mut text, &final_patterns);
-            let text = strip_thinking_tags(&text).trim().to_string();
+            let (clean, reasoning_content) = strip_and_capture_thinking_tags(&text);
+            let text = clean.trim().to_string();
             // `stopped_by_callback` is an independent signal from the C
             // layer that a stop sequence was hit — previously dropped.
-            let finish_reason =
-                if filter.is_stopped() || stopped_full || trimmed_partial || stopped_by_callback {
-                    "stop".to_string()
-                } else {
-                    "length".to_string()
-                };
+            //
+            // finish_reason gates on a REAL parse of the final text — the
+            // exact criterion `build_llm_response_envelope` uses — so the
+            // terminal token and the envelope can never disagree. The
+            // filter's marker-level `saw_tool_call_block` is deliberately
+            // NOT used here: a complete-but-unparseable block suppresses
+            // fine but is not a tool call.
+            let saw_tool_call_block = filter.saw_tool_call_block();
+            let emitted_tool_calls = suppress_tools
+                && !crate::runtime_adapter::tool_call::parse_tool_calls(&text).is_empty();
+            let finish_reason = if emitted_tool_calls {
+                "tool_calls".to_string()
+            } else if filter.is_stopped() || stopped_full || trimmed_partial || stopped_by_callback
+            {
+                "stop".to_string()
+            } else {
+                "length".to_string()
+            };
 
             // Send final empty token with finish_reason — matches the
             // pre-refactor contract so downstream consumers see a
             // terminal signal. Guarded on `token_index > 0` to avoid
             // emitting a stray terminal chunk when nothing was ever
-            // emitted (e.g. immediate stop).
-            if token_index > 0 {
-                let final_partial = PartialToken::new(String::new(), token_index, text.clone())
+            // emitted (e.g. immediate stop) — except when a tool block was
+            // suppressed: then the stream showed nothing on purpose and the
+            // terminal token is the caller's only signal.
+            if token_index > 0 || (suppress_tools && saw_tool_call_block) {
+                let final_cumulative = if suppress_tools {
+                    filter.cumulative_emitted().to_string()
+                } else {
+                    text.clone()
+                };
+                let final_partial = PartialToken::new(String::new(), token_index, final_cumulative)
                     .with_finish_reason(&finish_reason);
                 let _ = on_token(final_partial);
             }
 
-            Ok(GenerationOutput {
+            Ok(output_from_fields(
                 text,
-                tokens_generated: output_tokens.len(),
-                generation_time_ms: fields.generation_time_ms,
-                tokens_per_second: fields.tokens_per_second,
+                output_tokens.len(),
                 finish_reason,
-                ttft_ms: fields.ttft_ms,
-                mean_itl_ms: fields.mean_itl_ms,
-                p95_itl_ms: fields.p95_itl_ms,
-                emitted_chunks: fields.emitted_chunks,
-                inter_chunk_ms: fields.inter_chunk_ms,
-                decode_tps: fields.decode_tps,
-                prefill_tps: fields.prefill_tps,
-            })
+                reasoning_content,
+                fields,
+            ))
         })
     }
 
@@ -805,72 +1115,384 @@ impl LlmBackend for LlamaCppBackend {
     fn last_cached_prefix_len(&self) -> Option<usize> {
         self.kv_state.lock().ok().and_then(|s| s.last_prefix_hit)
     }
-}
 
-// =============================================================================
-// Stub implementation when llm-llamacpp feature is not enabled
-// =============================================================================
-
-#[cfg(not(feature = "llm-llamacpp"))]
-pub struct LlamaCppBackend;
-
-#[cfg(not(feature = "llm-llamacpp"))]
-impl LlamaCppBackend {
-    pub fn new() -> LlmResult<Self> {
-        Err(AdapterError::RuntimeError(
-            "llm-llamacpp feature not enabled. Build with --features llm-llamacpp".to_string(),
-        ))
-    }
-}
-
-#[cfg(not(feature = "llm-llamacpp"))]
-impl LlmBackend for LlamaCppBackend {
-    fn name(&self) -> &str {
-        "llama-cpp"
+    #[cfg(feature = "llm-llamacpp-vision")]
+    fn supports_vision(&self) -> bool {
+        true
     }
 
-    fn supported_formats(&self) -> Vec<&'static str> {
-        vec!["gguf"]
-    }
-
-    fn load(&mut self, _config: &LlmConfig) -> LlmResult<()> {
-        Err(AdapterError::RuntimeError(
-            "llm-llamacpp feature not enabled".to_string(),
-        ))
-    }
-
-    fn is_loaded(&self) -> bool {
-        false
-    }
-
-    fn unload(&mut self) -> LlmResult<()> {
-        Ok(())
-    }
-
-    fn generate(
+    #[cfg(feature = "llm-llamacpp-vision")]
+    fn generate_multimodal(
         &self,
-        _messages: &[ChatMessage],
-        _config: &GenerationConfig,
+        messages: &[MultimodalChatMessage],
+        config: &GenerationConfig,
     ) -> LlmResult<GenerationOutput> {
-        Err(AdapterError::RuntimeError(
-            "llm-llamacpp feature not enabled".to_string(),
-        ))
+        let inputs = mtmd_prompt_inputs_from_messages(messages)?;
+        let mmproj_path = self
+            .config
+            .as_ref()
+            .and_then(|config| config.vision_encoder_path.as_deref())
+            .ok_or_else(|| {
+                AdapterError::InvalidInput(
+                    "llama.cpp vision generation requires a vision encoder artifact".to_string(),
+                )
+            })?
+            .to_string();
+
+        self.with_model_and_context(|model, context| {
+            let prompt = chat::format_chat_prompt(
+                model,
+                &inputs.chat_messages,
+                self.reasoning_enabled(),
+                &config.tools,
+            )?;
+            let generation_stop_patterns =
+                merge_stop_patterns(&config.stop_sequences, CHAT_STOP_PATTERNS);
+            let (_loaded, (output_tokens, stopped_by_callback, fields, image_preprocess_ms)) = self
+                .with_mtmd_context_loaded(model, &mmproj_path, |mtmd_context| {
+                    let image_preprocess_started = std::time::Instant::now();
+                    let bitmaps = inputs
+                        .images
+                        .iter()
+                        .map(|image| image.build_bitmap(mtmd_context))
+                        .collect::<Result<Vec<_>, _>>()?;
+
+                    let chunks = xybrid_llama::MtmdInputChunks::tokenize(
+                        mtmd_context,
+                        &prompt,
+                        true,
+                        true,
+                        &bitmaps,
+                    )?;
+                    let summary = chunks.summary()?;
+                    let image_preprocess_ms = if !inputs.images.is_empty() {
+                        let elapsed_ms = image_preprocess_started.elapsed().as_millis().max(1);
+                        let image_preprocess_ms = elapsed_ms.min(u32::MAX as u128) as u32;
+                        xybrid_trace::add_metadata(
+                            "image_preprocess_ms",
+                            image_preprocess_ms.to_string(),
+                        );
+                        Some(image_preprocess_ms)
+                    } else {
+                        None
+                    };
+                    context.kv_cache_clear();
+                    self.clear_cached_prefix_state();
+                    xybrid_trace::add_metadata(
+                        "tokens_in",
+                        summary.helper_total_tokens.to_string(),
+                    );
+                    let n_batch = self.config.as_ref().map_or(512, |config| {
+                        if config.n_batch == 0 {
+                            512
+                        } else {
+                            config.n_batch
+                        }
+                    });
+                    let new_n_past = xybrid_llama::mtmd_helper_eval_chunks(
+                        mtmd_context,
+                        context,
+                        &chunks,
+                        0,
+                        0,
+                        n_batch,
+                        true,
+                    )?;
+                    if new_n_past < 0 {
+                        return Err(AdapterError::RuntimeError(format!(
+                            "mtmd helper eval returned negative n_past: {}",
+                            new_n_past
+                        )));
+                    }
+
+                    let mut tel = StreamingTelemetry::new(summary.helper_total_tokens);
+                    let (output_tokens, stopped_by_callback) =
+                        xybrid_llama::generate_from_current_logits_streaming(
+                            context,
+                            model,
+                            config.max_tokens,
+                            config.temperature,
+                            config.top_p,
+                            config.min_p,
+                            config.top_k,
+                            config.repetition_penalty,
+                            &generation_stop_patterns,
+                            config.grammar.as_deref(),
+                            new_n_past as usize,
+                            |_token_id, _token_text| {
+                                tel.record_chunk();
+                                Ok(())
+                            },
+                        )?;
+                    let fields = tel.finalize(output_tokens.len());
+                    Ok((
+                        output_tokens,
+                        stopped_by_callback,
+                        fields,
+                        image_preprocess_ms,
+                    ))
+                })?;
+
+            let final_stop_patterns =
+                merge_stop_patterns(&generation_stop_patterns, CHAT_STOP_PATTERNS_BROKEN);
+            let mut text = model.detokenize(&output_tokens)?;
+            let stopped_in_text = truncate_at_first_stop(&mut text, &final_stop_patterns);
+            let trimmed_partial = trim_partial_stop_suffix(&mut text, &final_stop_patterns);
+            let (clean, reasoning_content) = strip_and_capture_thinking_tags(&text);
+            let text = clean.trim().to_string();
+            let finish_reason = if stopped_in_text || trimmed_partial || stopped_by_callback {
+                "stop"
+            } else {
+                "length"
+            }
+            .to_string();
+
+            Ok(GenerationOutput {
+                text,
+                tokens_generated: output_tokens.len(),
+                generation_time_ms: fields.generation_time_ms,
+                tokens_per_second: fields.tokens_per_second,
+                finish_reason,
+                ttft_ms: fields.ttft_ms,
+                mean_itl_ms: fields.mean_itl_ms,
+                p95_itl_ms: fields.p95_itl_ms,
+                emitted_chunks: fields.emitted_chunks,
+                inter_chunk_ms: fields.inter_chunk_ms,
+                decode_tps: fields.decode_tps,
+                prefill_tps: fields.prefill_tps,
+                image_preprocess_ms,
+                reasoning_content,
+            })
+        })
     }
 
-    fn generate_raw(
+    #[cfg(feature = "llm-llamacpp-vision")]
+    fn generate_multimodal_streaming(
         &self,
-        _prompt: &str,
-        _config: &GenerationConfig,
+        messages: &[MultimodalChatMessage],
+        config: &GenerationConfig,
+        on_token: crate::runtime_adapter::llm::StreamingCallback<'_>,
     ) -> LlmResult<GenerationOutput> {
-        Err(AdapterError::RuntimeError(
-            "llm-llamacpp feature not enabled".to_string(),
-        ))
+        let mut on_token = on_token;
+
+        let inputs = mtmd_prompt_inputs_from_messages(messages)?;
+        let mmproj_path = self
+            .config
+            .as_ref()
+            .and_then(|config| config.vision_encoder_path.as_deref())
+            .ok_or_else(|| {
+                AdapterError::InvalidInput(
+                    "llama.cpp vision generation requires a vision encoder artifact".to_string(),
+                )
+            })?
+            .to_string();
+
+        self.with_model_and_context(|model, context| {
+            let prompt = chat::format_chat_prompt(
+                model,
+                &inputs.chat_messages,
+                self.reasoning_enabled(),
+                &config.tools,
+            )?;
+            let generation_stop_patterns =
+                merge_stop_patterns(&config.stop_sequences, CHAT_STOP_PATTERNS);
+            let suppress_tools = !config.tools.is_empty();
+            let (
+                _loaded,
+                (
+                    output_tokens,
+                    stopped_by_callback,
+                    fields,
+                    image_preprocess_ms,
+                    filter_stopped,
+                    filter_saw_tool_call_block,
+                    filter_cumulative,
+                    token_index,
+                ),
+            ) = self.with_mtmd_context_loaded(model, &mmproj_path, |mtmd_context| {
+                let image_preprocess_started = std::time::Instant::now();
+                let bitmaps = inputs
+                    .images
+                    .iter()
+                    .map(|image| image.build_bitmap(mtmd_context))
+                    .collect::<Result<Vec<_>, _>>()?;
+
+                let chunks = xybrid_llama::MtmdInputChunks::tokenize(
+                    mtmd_context,
+                    &prompt,
+                    true,
+                    true,
+                    &bitmaps,
+                )?;
+                let summary = chunks.summary()?;
+                let image_preprocess_ms = if !inputs.images.is_empty() {
+                    let elapsed_ms = image_preprocess_started.elapsed().as_millis().max(1);
+                    let image_preprocess_ms = elapsed_ms.min(u32::MAX as u128) as u32;
+                    xybrid_trace::add_metadata(
+                        "image_preprocess_ms",
+                        image_preprocess_ms.to_string(),
+                    );
+                    Some(image_preprocess_ms)
+                } else {
+                    None
+                };
+
+                context.kv_cache_clear();
+                self.clear_cached_prefix_state();
+                xybrid_trace::add_metadata("tokens_in", summary.helper_total_tokens.to_string());
+                let n_batch = self.config.as_ref().map_or(512, |config| {
+                    if config.n_batch == 0 {
+                        512
+                    } else {
+                        config.n_batch
+                    }
+                });
+                let new_n_past = xybrid_llama::mtmd_helper_eval_chunks(
+                    mtmd_context,
+                    context,
+                    &chunks,
+                    0,
+                    0,
+                    n_batch,
+                    true,
+                )?;
+                if new_n_past < 0 {
+                    return Err(AdapterError::RuntimeError(format!(
+                        "mtmd helper eval returned negative n_past: {}",
+                        new_n_past
+                    )));
+                }
+
+                let mut tel = StreamingTelemetry::new(summary.helper_total_tokens);
+                let mut filter = if self.reasoning_enabled() {
+                    StreamingTextFilter::new_reasoning_primed(generation_stop_patterns.clone())
+                } else {
+                    StreamingTextFilter::new(generation_stop_patterns.clone())
+                };
+                if suppress_tools {
+                    filter = filter.with_tool_call_suppression();
+                }
+                let mut token_index = 0usize;
+                let stream_result = xybrid_llama::generate_from_current_logits_streaming(
+                    context,
+                    model,
+                    config.max_tokens,
+                    config.temperature,
+                    config.top_p,
+                    config.min_p,
+                    config.top_k,
+                    config.repetition_penalty,
+                    &generation_stop_patterns,
+                    config.grammar.as_deref(),
+                    new_n_past as usize,
+                    |token_id, token_text| {
+                        tel.record_chunk();
+                        emit_filtered_partial_token(
+                            &mut filter,
+                            token_id,
+                            token_text,
+                            &mut token_index,
+                            &mut on_token,
+                        )
+                    },
+                );
+                let (output_tokens, stopped_by_callback) = match stream_result {
+                    Ok(result) => result,
+                    Err(err) => {
+                        self.reset_kv_cache_after_failed_stream(context);
+                        return Err(err.into());
+                    }
+                };
+                let fields = tel.finalize(output_tokens.len());
+                Ok((
+                    output_tokens,
+                    stopped_by_callback,
+                    fields,
+                    image_preprocess_ms,
+                    filter.is_stopped(),
+                    filter.saw_tool_call_block(),
+                    filter.cumulative_emitted().to_string(),
+                    token_index,
+                ))
+            })?;
+
+            let final_stop_patterns =
+                merge_stop_patterns(&generation_stop_patterns, CHAT_STOP_PATTERNS_BROKEN);
+            let mut text = model.detokenize(&output_tokens)?;
+            let stopped_in_text = truncate_at_first_stop(&mut text, &final_stop_patterns);
+            let trimmed_partial = trim_partial_stop_suffix(&mut text, &final_stop_patterns);
+            let (clean, reasoning_content) = strip_and_capture_thinking_tags(&text);
+            let text = clean.trim().to_string();
+            // Same real-parse gate as the text streaming site: the terminal
+            // token's finish_reason must match what the executor's envelope
+            // will report, and a complete-but-unparseable block is not a
+            // tool call.
+            let emitted_tool_calls = suppress_tools
+                && !crate::runtime_adapter::tool_call::parse_tool_calls(&text).is_empty();
+            let finish_reason = if emitted_tool_calls {
+                "tool_calls".to_string()
+            } else if filter_stopped || stopped_in_text || trimmed_partial || stopped_by_callback {
+                "stop".to_string()
+            } else {
+                "length".to_string()
+            };
+
+            if token_index > 0 || (suppress_tools && filter_saw_tool_call_block) {
+                let final_cumulative = if suppress_tools {
+                    filter_cumulative
+                } else {
+                    text.clone()
+                };
+                let final_partial = PartialToken::new(String::new(), token_index, final_cumulative)
+                    .with_finish_reason(&finish_reason);
+                let _ = on_token(final_partial);
+            }
+
+            Ok(GenerationOutput {
+                text,
+                tokens_generated: output_tokens.len(),
+                generation_time_ms: fields.generation_time_ms,
+                tokens_per_second: fields.tokens_per_second,
+                finish_reason,
+                ttft_ms: fields.ttft_ms,
+                mean_itl_ms: fields.mean_itl_ms,
+                p95_itl_ms: fields.p95_itl_ms,
+                emitted_chunks: fields.emitted_chunks,
+                inter_chunk_ms: fields.inter_chunk_ms,
+                decode_tps: fields.decode_tps,
+                prefill_tps: fields.prefill_tps,
+                image_preprocess_ms,
+                reasoning_content,
+            })
+        })
     }
 }
 
-#[cfg(all(test, feature = "llm-llamacpp"))]
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chat_stop_patterns_includes_user_stops_and_broken_variants() {
+        let config = GenerationConfig {
+            stop_sequences: vec!["<<END>>".to_string()],
+            ..Default::default()
+        };
+        let patterns = chat_stop_patterns(&config);
+        assert!(
+            patterns.iter().any(|p| p == "<<END>>"),
+            "user-supplied stop must survive the merge"
+        );
+        // The `_BROKEN` variants are the drift-prone set the review flagged:
+        // `generate` and `generate_streaming` must both include them for
+        // final-text cleanup. Guards against the two paths diverging.
+        for broken in CHAT_STOP_PATTERNS_BROKEN {
+            assert!(
+                patterns.iter().any(|p| p == broken),
+                "broken chat-marker variant {broken:?} must be present"
+            );
+        }
+    }
 
     #[test]
     fn backend_reports_true_streaming_for_sdk_cancellation_gate() {
@@ -880,6 +1502,218 @@ mod tests {
             backend.supports_streaming(),
             "llama.cpp must stay on the true streaming path so SDK abort checks can interrupt generation"
         );
+    }
+
+    #[test]
+    fn filtered_stream_callback_errors_propagate_to_native_stream() {
+        let mut filter = StreamingTextFilter::new(vec![]);
+        let mut token_index = 0usize;
+        let mut callback: crate::runtime_adapter::llm::StreamingCallback<'_> =
+            Box::new(|_| Err("user cancelled".into()));
+
+        let err =
+            emit_filtered_partial_token(&mut filter, 42, "hello", &mut token_index, &mut callback)
+                .unwrap_err();
+
+        assert_eq!(token_index, 1);
+        assert!(err.to_string().contains("user cancelled"));
+    }
+
+    #[test]
+    fn load_rejects_missing_vision_encoder_before_parsing_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let model_path = dir.path().join("model.gguf");
+        std::fs::write(&model_path, b"not a real gguf").unwrap();
+        let missing_mmproj = dir.path().join("missing-mmproj.gguf");
+
+        let mut backend = LlamaCppBackend::new().unwrap();
+        let err = backend
+            .load(
+                &LlmConfig::new(model_path.to_string_lossy().to_string())
+                    .with_vision_encoder(missing_mmproj.to_string_lossy().to_string()),
+            )
+            .unwrap_err();
+
+        match err {
+            AdapterError::MissingArtifact { artifact, path } => {
+                assert_eq!(artifact, "vision_encoder");
+                assert!(path.contains("missing-mmproj.gguf"));
+            }
+            other => panic!("expected MissingArtifact for missing mmproj, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "llm-llamacpp-vision")]
+    #[test]
+    fn mtmd_context_load_is_lazy_and_reused_for_same_mmproj() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+
+        let backend = LlamaCppBackend::new().unwrap();
+        let load_count = Arc::new(AtomicUsize::new(0));
+        let count_for_first_load = load_count.clone();
+
+        let first_loaded = backend
+            .ensure_mtmd_context_loaded_with("/models/mmproj.gguf", move |_| {
+                count_for_first_load.fetch_add(1, Ordering::SeqCst);
+                Ok(xybrid_llama::MtmdContext::test_stub())
+            })
+            .unwrap();
+        let second_loaded = backend
+            .ensure_mtmd_context_loaded_with("/models/mmproj.gguf", |_| {
+                panic!("same mmproj path should reuse existing mtmd context")
+            })
+            .unwrap();
+
+        assert!(first_loaded);
+        assert!(!second_loaded);
+        assert_eq!(load_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[cfg(feature = "llm-llamacpp-vision")]
+    #[test]
+    fn mtmd_context_loader_exposes_reused_context_to_callers() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+
+        let backend = LlamaCppBackend::new().unwrap();
+        let load_count = Arc::new(AtomicUsize::new(0));
+        let closure_count = Arc::new(AtomicUsize::new(0));
+        let count_for_first_load = load_count.clone();
+        let count_for_first_closure = closure_count.clone();
+
+        let (first_loaded, first_value) = backend
+            .with_mtmd_context_loaded_with(
+                "/models/mmproj.gguf",
+                move |_| {
+                    count_for_first_load.fetch_add(1, Ordering::SeqCst);
+                    Ok(xybrid_llama::MtmdContext::test_stub())
+                },
+                move |_| {
+                    count_for_first_closure.fetch_add(1, Ordering::SeqCst);
+                    Ok(41)
+                },
+            )
+            .unwrap();
+        let count_for_second_closure = closure_count.clone();
+        let (second_loaded, second_value) = backend
+            .with_mtmd_context_loaded_with(
+                "/models/mmproj.gguf",
+                |_| panic!("same mmproj path should reuse existing mtmd context"),
+                move |_| {
+                    count_for_second_closure.fetch_add(1, Ordering::SeqCst);
+                    Ok(42)
+                },
+            )
+            .unwrap();
+
+        assert!(first_loaded);
+        assert_eq!(first_value, 41);
+        assert!(!second_loaded);
+        assert_eq!(second_value, 42);
+        assert_eq!(load_count.load(Ordering::SeqCst), 1);
+        assert_eq!(closure_count.load(Ordering::SeqCst), 2);
+    }
+
+    #[cfg(feature = "llm-llamacpp-vision")]
+    #[test]
+    fn mtmd_prompt_inputs_preserve_image_order_and_marker_parity() {
+        use crate::ir::{Envelope, EnvelopeKind, MessageRole};
+        use crate::runtime_adapter::MultimodalChatMessage;
+
+        fn png_image(red: u8) -> Vec<u8> {
+            let image = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+                1,
+                1,
+                image::Rgb([red, 34, 51]),
+            ));
+            let mut encoded = std::io::Cursor::new(Vec::new());
+            image
+                .write_to(&mut encoded, image::ImageFormat::Png)
+                .expect("test image encodes");
+            encoded.into_inner()
+        }
+
+        let first = Envelope::image(png_image(17), "png")
+            .unwrap()
+            .with_local_id("first-image");
+        let second = Envelope::image(png_image(99), "png")
+            .unwrap()
+            .with_local_id("second-image");
+        let message = Envelope::new(EnvelopeKind::MultiPart(vec![
+            Envelope::new(EnvelopeKind::Text("look ".to_string())),
+            first,
+            Envelope::new(EnvelopeKind::Text(" compare ".to_string())),
+            second,
+        ]))
+        .with_role(MessageRole::User);
+        let messages = vec![MultimodalChatMessage::from_envelope(&message).unwrap()];
+
+        let inputs = mtmd_prompt_inputs_from_messages(&messages).unwrap();
+
+        assert_eq!(inputs.chat_messages.len(), 1);
+        assert_eq!(inputs.chat_messages[0].role, MessageRole::User);
+        assert_eq!(
+            inputs.chat_messages[0].content,
+            "look <__media__> compare <__media__>"
+        );
+        assert_eq!(inputs.images.len(), 2);
+        assert_eq!(inputs.images[0].local_id, "first-image");
+        assert_eq!(inputs.images[1].local_id, "second-image");
+        // Encoded sources stay on the encoded payload path (byte-for-byte
+        // unchanged); each carries non-empty container bytes.
+        assert!(inputs.images.iter().all(|image| matches!(
+            &image.payload,
+            MtmdPromptPayload::Encoded { bytes } if !bytes.is_empty()
+        )));
+    }
+
+    #[cfg(feature = "llm-llamacpp-vision")]
+    #[test]
+    fn mtmd_prompt_inputs_route_raw_frames_to_packed_rgb() {
+        use crate::ir::{Envelope, EnvelopeKind, MessageRole, PixelFormat};
+        use crate::runtime_adapter::MultimodalChatMessage;
+
+        // 2x1 raw RGBA frame -> tightly-packed RGB (alpha + nothing else stripped).
+        let raw = Envelope::image_raw(
+            vec![255, 0, 0, 200, 0, 128, 255, 210],
+            PixelFormat::Rgba8,
+            2,
+            1,
+            vec![crate::ir::ImagePlane {
+                offset: 0,
+                row_stride: 8,
+                pixel_stride: 4,
+                width: 2,
+                height: 1,
+            }],
+            None,
+        )
+        .unwrap()
+        .with_local_id("raw-frame");
+        let message = Envelope::new(EnvelopeKind::MultiPart(vec![
+            Envelope::new(EnvelopeKind::Text("describe ".to_string())),
+            raw,
+        ]))
+        .with_role(MessageRole::User);
+        let messages = vec![MultimodalChatMessage::from_envelope(&message).unwrap()];
+
+        let inputs = mtmd_prompt_inputs_from_messages(&messages).unwrap();
+
+        assert_eq!(inputs.images.len(), 1);
+        assert_eq!(inputs.images[0].local_id, "raw-frame");
+        match &inputs.images[0].payload {
+            MtmdPromptPayload::RawRgb { rgb, width, height } => {
+                assert_eq!(*width, 2);
+                assert_eq!(*height, 1);
+                assert_eq!(rgb.as_slice(), &[255, 0, 0, 0, 128, 255]);
+            }
+            other => panic!("expected packed RGB payload, got {other:?}"),
+        }
     }
 
     #[test]

@@ -22,8 +22,10 @@
 //!
 //! # Example
 //!
-//! ```rust,ignore
-//! use xybrid_core::runtime_adapter::{RuntimeAdapter, OnnxRuntimeAdapter};
+//! ```no_run
+//! # fn _example() -> Result<(), Box<dyn std::error::Error>> {
+//! use xybrid_core::runtime_adapter::RuntimeAdapter;
+//! use xybrid_core::runtime_adapter::onnx::OnnxRuntimeAdapter;
 //! use xybrid_core::ir::{Envelope, EnvelopeKind};
 //!
 //! // Create adapter
@@ -35,6 +37,9 @@
 //! // Run inference
 //! let input = Envelope::new(EnvelopeKind::Text("hello world".to_string()));
 //! let output = adapter.execute(&input)?;
+//! # let _ = output;
+//! # Ok(())
+//! # }
 //! ```
 
 use crate::ir::Envelope;
@@ -49,6 +54,17 @@ pub mod traits;
 
 // Always-available types for FFI/bindings (NOT feature-gated)
 pub mod types;
+
+// Always-compiled tool-call text protocols, LFM2- and gemma-4-family
+// (parser + continuation composer).
+pub mod tool_call;
+
+// JSON-Schema → GBNF conversion for constrained decoding. Pure Rust, no llama
+// dependency, so it is always compiled (referenced by `GenerationConfig`).
+pub mod grammar;
+
+// Shared vision contracts for embedding-style multimodal backends.
+pub mod vision;
 
 // Runtime backends (organized in subdirectories)
 pub mod onnx;
@@ -118,7 +134,7 @@ pub use mistral::MistralBackend;
 #[cfg(feature = "llm-llamacpp")]
 pub use llama_cpp::LlamaCppBackend;
 
-// llama.cpp log control exports
+// llama.cpp log control exports.
 #[cfg(feature = "llm-llamacpp")]
 pub use llama_cpp::{llama_log_get_verbosity, llama_log_set_verbosity};
 
@@ -130,12 +146,31 @@ pub use traits::ModelRuntime;
 pub use types::{
     ChatMessage, GenerationConfig, LlmConfig, PartialToken, StreamingCallback, StreamingError,
 };
+pub use types::{MultimodalChatMessage, MultimodalImagePart, MultimodalMessagePart};
+pub use vision::{VisionEmbeddings, VisionEncoder, VisionTokenId};
 
 /// Error type for runtime adapter operations.
 #[derive(Error, Debug)]
 pub enum AdapterError {
     #[error("Model not found: {0}")]
     ModelNotFound(String),
+    #[error("Missing artifact: {artifact} at {path}")]
+    MissingArtifact { artifact: String, path: String },
+    #[error(
+        "Unsupported model capability: model '{model_id}' does not support {capability}; {hint}"
+    )]
+    UnsupportedModelCapability {
+        model_id: String,
+        capability: String,
+        hint: String,
+    },
+    #[error("Unsupported backend capability: model '{model_id}' requires {capability}, but backend/build '{backend}' does not support {capability}; {hint}")]
+    UnsupportedBackendCapability {
+        model_id: String,
+        backend: String,
+        capability: String,
+        hint: String,
+    },
     #[error("Model not loaded: {0}")]
     ModelNotLoaded(String),
     #[error("Invalid input: {0}")]
@@ -164,6 +199,57 @@ impl AdapterError {
         match self {
             Self::AbortedForCloudFallback { reason } => Some(*reason),
             _ => None,
+        }
+    }
+}
+
+/// 1:1 mapping from `xybrid-llama`'s typed error surface to the runtime
+/// adapter error. Added in Phase 2 of the `llamacpp-crate-split` epic so
+/// the safe wrappers in `xybrid-llama` can return [`xybrid_llama::LlamaError`]
+/// and the call sites in `runtime_adapter::llama_cpp` keep their
+/// `Result<..., AdapterError>` shape unchanged via `?`.
+///
+/// Gated on `llm-llamacpp` because `xybrid-llama` (the crate providing
+/// `LlamaError`) is only in the dep graph when that feature links the
+/// llama.cpp runtime.
+///
+/// The `StreamingCallbackAborted` arm forwards through
+/// [`AdapterError::from_streaming_callback_error`] so that
+/// `xybrid-core::abort::CloudFallbackAbort` is downcast back to
+/// `AdapterError::AbortedForCloudFallback` exactly as it did before the
+/// refactor.
+#[cfg(feature = "llm-llamacpp")]
+impl From<xybrid_llama::LlamaError> for AdapterError {
+    fn from(err: xybrid_llama::LlamaError) -> Self {
+        use xybrid_llama::LlamaError;
+        match err {
+            LlamaError::InvalidInput(msg) => Self::InvalidInput(msg),
+            LlamaError::LoadFailed(path) => {
+                Self::RuntimeError(format!("Failed to load model from {path}"))
+            }
+            LlamaError::ContextCreationFailed(msg) => {
+                Self::RuntimeError(format!("Failed to create context: {msg}"))
+            }
+            LlamaError::TokenizationFailed => Self::RuntimeError("Tokenization failed".to_string()),
+            LlamaError::DecodeFailed {
+                code,
+                n_past_in,
+                detail,
+            } => Self::RuntimeError(format!(
+                "Generation failed with error code {code} ({detail}; n_past_in={n_past_in})"
+            )),
+            LlamaError::StreamingCallbackAborted(boxed) => {
+                Self::from_streaming_callback_error(boxed)
+            }
+            LlamaError::ChatTemplateFailed { detail } => {
+                Self::RuntimeError(format!("Chat template render failed: {detail}"))
+            }
+            LlamaError::Internal(msg) => Self::RuntimeError(msg),
+            // Forward-compatibility for `#[non_exhaustive]` LlamaError —
+            // any variant added in xybrid-llama after this match was
+            // written falls through to a generic RuntimeError until the
+            // mapping above is updated.
+            other => Self::RuntimeError(format!("llama error: {other}")),
         }
     }
 }
@@ -244,11 +330,19 @@ pub trait RuntimeAdapter: Send + Sync {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
+    /// ```no_run
+    /// # fn _example() -> Result<(), Box<dyn std::error::Error>> {
+    /// use xybrid_core::ir::{Envelope, EnvelopeKind};
+    /// use xybrid_core::runtime_adapter::{OnnxRuntimeAdapter, RuntimeAdapter};
+    ///
     /// let mut adapter = OnnxRuntimeAdapter::new();
     /// adapter.load_model("model.onnx")?;
     /// adapter.warmup()?;  // Optional: trigger GPU initialization
+    /// # let input = Envelope::new(EnvelopeKind::Text("probe".into()));
     /// let output = adapter.execute(&input)?;  // First inference is now fast
+    /// # let _ = output;
+    /// # Ok(())
+    /// # }
     /// ```
     fn warmup(&mut self) -> AdapterResult<()> {
         Ok(())

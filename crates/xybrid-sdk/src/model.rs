@@ -6,14 +6,17 @@
 //! - `ModelHandle`: Internal state management for the loaded model
 //! - `StreamEvent`: Events emitted during streaming inference
 
+use crate::cache::CacheManager;
 use crate::registry_client::RegistryClient;
 use crate::result::{InferenceResult, OutputType};
-use crate::run_options::{check_abort_for_streaming, AbortState, CancellationToken, RunOptions};
+use crate::run_options::{
+    check_abort_for_streaming, AbortState, CancellationToken, LiveModeTag, RunOptions,
+};
 use crate::source::{detect_platform, ModelSource};
 use crate::stream::XybridStream;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 use tokio_stream::wrappers::ReceiverStream;
@@ -60,7 +63,20 @@ pub enum StreamEvent {
     Error(String),
 }
 
+/// A boxed, thread-safe error cause carried by the wrapping [`SdkError`]
+/// variants so the underlying error stays `source()`-walkable and
+/// downcastable instead of being flattened into a string.
+pub type SdkErrorSource = Box<dyn std::error::Error + Send + Sync>;
+
 /// SDK-level error type.
+///
+/// The variants that wrap an underlying failure (`LoadError`,
+/// `InferenceError`, `NetworkError`, `CacheError`, `PipelineError`,
+/// `Offline`) carry the original error as a `#[source]` cause rather than
+/// pre-formatting it into the message, so callers can walk
+/// [`std::error::Error::source`] and downcast to the real type. Construct
+/// them with the [`SdkError::inference`] / [`SdkError::inference_src`]
+/// family of helpers.
 #[derive(Debug, thiserror::Error)]
 pub enum SdkError {
     #[error("Model not found: {0}")]
@@ -71,10 +87,35 @@ pub enum SdkError {
     MetadataNotFound(String),
     #[error("model_metadata.json is invalid: {0}")]
     MetadataInvalid(String),
-    #[error("Failed to load model: {0}")]
-    LoadError(String),
-    #[error("Inference failed: {0}")]
-    InferenceError(String),
+    #[error("Failed to load model: {message}")]
+    LoadError {
+        message: String,
+        #[source]
+        source: Option<SdkErrorSource>,
+    },
+    #[error("Inference failed: {message}")]
+    InferenceError {
+        message: String,
+        #[source]
+        source: Option<SdkErrorSource>,
+    },
+    #[error("Missing artifact: {artifact} at {path}")]
+    MissingArtifact { artifact: String, path: String },
+    #[error(
+        "Unsupported model capability: model '{model_id}' does not support {capability}; {hint}"
+    )]
+    UnsupportedModelCapability {
+        model_id: String,
+        capability: String,
+        hint: String,
+    },
+    #[error("Unsupported backend capability: model '{model_id}' requires {capability}, but backend/build '{backend}' does not support {capability}; {hint}")]
+    UnsupportedBackendCapability {
+        model_id: String,
+        backend: String,
+        capability: String,
+        hint: String,
+    },
     /// Local streaming aborted under resource pressure with the caller's
     /// permission to retry on cloud (`AbortPolicy::fallback_to_cloud`).
     /// `run_streaming_with_fallback` catches this variant; lower-level
@@ -90,21 +131,37 @@ pub enum SdkError {
     NotLoaded,
     #[error("Invalid configuration: {0}")]
     ConfigError(String),
-    #[error("Network error: {0}")]
-    NetworkError(String),
+    #[error("Network error: {message}")]
+    NetworkError {
+        message: String,
+        #[source]
+        source: Option<SdkErrorSource>,
+    },
     /// The registry could not be reached at all (DNS failure, connection refused,
     /// network unreachable, interface down). This is distinct from `NetworkError`
     /// because it represents *local* unreachability rather than a server-side problem,
     /// and the circuit breaker treats it differently — offline errors don't count
     /// toward the failure threshold so callers aren't punished for being offline.
-    #[error("Registry unreachable: {0}")]
-    Offline(String),
+    #[error("Registry unreachable: {message}")]
+    Offline {
+        message: String,
+        #[source]
+        source: Option<SdkErrorSource>,
+    },
     #[error("IO error: {0}")]
     IoError(#[from] std::io::Error),
-    #[error("Cache error: {0}")]
-    CacheError(String),
-    #[error("Pipeline error: {0}")]
-    PipelineError(String),
+    #[error("Cache error: {message}")]
+    CacheError {
+        message: String,
+        #[source]
+        source: Option<SdkErrorSource>,
+    },
+    #[error("Pipeline error: {message}")]
+    PipelineError {
+        message: String,
+        #[source]
+        source: Option<SdkErrorSource>,
+    },
     #[error("Circuit breaker open: {0}")]
     CircuitOpen(String),
     #[error("Rate limited, retry after {retry_after_secs} seconds")]
@@ -113,28 +170,79 @@ pub enum SdkError {
     Timeout { timeout_ms: u64 },
 }
 
+/// Generates the `message`-only and `_src` (cause-chaining) constructors for
+/// the wrapping `SdkError` variants, so call sites stay terse
+/// (`SdkError::cache_src("…", e)`) while preserving the underlying cause.
+macro_rules! sdk_error_ctors {
+    ($($msg_fn:ident, $src_fn:ident => $variant:ident);+ $(;)?) => {
+        impl SdkError {
+            $(
+                #[doc = concat!("Build [`SdkError::", stringify!($variant), "`] from a message with no underlying cause.")]
+                pub(crate) fn $msg_fn(message: impl Into<String>) -> Self {
+                    SdkError::$variant { message: message.into(), source: None }
+                }
+
+                #[doc = concat!("Build [`SdkError::", stringify!($variant), "`] from a message, chaining `source` as the `#[source]` cause.")]
+                pub(crate) fn $src_fn(
+                    message: impl Into<String>,
+                    source: impl Into<SdkErrorSource>,
+                ) -> Self {
+                    SdkError::$variant { message: message.into(), source: Some(source.into()) }
+                }
+            )+
+        }
+    };
+}
+
+sdk_error_ctors! {
+    load, load_src => LoadError;
+    inference, inference_src => InferenceError;
+    network, network_src => NetworkError;
+    cache, cache_src => CacheError;
+    pipeline, pipeline_src => PipelineError;
+    offline, offline_src => Offline;
+}
+
 /// Result type for SDK operations.
 pub type SdkResult<T> = Result<T, SdkError>;
 
-impl xybrid_core::http::RetryableError for SdkError {
-    fn is_retryable(&self) -> bool {
+impl SdkError {
+    /// Whether retrying the operation that produced this error could
+    /// succeed without the caller changing anything.
+    ///
+    /// Transient failures (`NetworkError`, `RateLimited`, `Timeout`,
+    /// `Offline`) are retryable; everything else — including
+    /// `CircuitOpen`, `ConfigError`, `ModelNotFound`, `LoadError`,
+    /// `InferenceError`, and `AbortedForCloudFallback` — is not. `Offline`
+    /// is retryable only across *different* registry URLs (a fallback
+    /// registry may be reachable when the primary isn't); within a single
+    /// URL the retry loop short-circuits (see `registry_client`).
+    ///
+    /// This is the inherent form of the [`xybrid_core::http::RetryableError`]
+    /// trait method, exposed directly on `SdkError` so callers (and the
+    /// FFI / UniFFI layers) can query retryability without importing the
+    /// trait. The trait impl forwards here.
+    pub fn is_retryable(&self) -> bool {
         match self {
             // Retryable errors (transient failures)
-            SdkError::NetworkError(_) => true,
+            SdkError::NetworkError { .. } => true,
             SdkError::RateLimited { .. } => true,
             SdkError::Timeout { .. } => true,
             // Offline is "retryable" only across URLs — the fallback registry
             // may be reachable even when the primary isn't. Within a single URL
             // the retry loop short-circuits immediately (see registry_client).
-            SdkError::Offline(_) => true,
+            SdkError::Offline { .. } => true,
 
             // Non-retryable errors (permanent failures)
             SdkError::ModelNotFound(_) => false,
             SdkError::DirectoryNotFound(_) => false,
             SdkError::MetadataNotFound(_) => false,
             SdkError::MetadataInvalid(_) => false,
-            SdkError::LoadError(_) => false,
-            SdkError::InferenceError(_) => false,
+            SdkError::LoadError { .. } => false,
+            SdkError::InferenceError { .. } => false,
+            SdkError::MissingArtifact { .. } => false,
+            SdkError::UnsupportedModelCapability { .. } => false,
+            SdkError::UnsupportedBackendCapability { .. } => false,
             // Resource-driven abort is not retryable on the same path; the
             // wrapper redirects to cloud instead.
             SdkError::AbortedForCloudFallback { .. } => false,
@@ -142,13 +250,20 @@ impl xybrid_core::http::RetryableError for SdkError {
             SdkError::NotLoaded => false,
             SdkError::ConfigError(_) => false,
             SdkError::IoError(_) => false,
-            SdkError::CacheError(_) => false,
-            SdkError::PipelineError(_) => false,
+            SdkError::CacheError { .. } => false,
+            SdkError::PipelineError { .. } => false,
             SdkError::CircuitOpen(_) => false, // Don't retry when circuit is open
         }
     }
 
-    fn retry_after(&self) -> Option<std::time::Duration> {
+    /// The minimum delay a caller should wait before retrying, when the
+    /// error itself dictates one. Only `RateLimited` carries a
+    /// server-specified backoff; every other variant returns `None`
+    /// (the caller picks its own backoff if [`Self::is_retryable`]).
+    ///
+    /// Inherent form of [`xybrid_core::http::RetryableError::retry_after`];
+    /// the trait impl forwards here.
+    pub fn retry_after(&self) -> Option<std::time::Duration> {
         match self {
             SdkError::RateLimited { retry_after_secs } => {
                 Some(std::time::Duration::from_secs(*retry_after_secs))
@@ -158,12 +273,62 @@ impl xybrid_core::http::RetryableError for SdkError {
     }
 }
 
+fn sdk_execution_error<E>(context: &str, error: E) -> SdkError
+where
+    E: Into<xybrid_core::error::XybridError>,
+{
+    let error = error.into();
+    match error {
+        xybrid_core::error::XybridError::MissingArtifact { artifact, path } => {
+            SdkError::MissingArtifact { artifact, path }
+        }
+        xybrid_core::error::XybridError::UnsupportedModelCapability {
+            model_id,
+            capability,
+            hint,
+        } => SdkError::UnsupportedModelCapability {
+            model_id,
+            capability,
+            hint,
+        },
+        xybrid_core::error::XybridError::UnsupportedBackendCapability {
+            model_id,
+            backend,
+            capability,
+            hint,
+        } => SdkError::UnsupportedBackendCapability {
+            model_id,
+            backend,
+            capability,
+            hint,
+        },
+        other => SdkError::inference_src(context, other),
+    }
+}
+
+impl xybrid_core::http::RetryableError for SdkError {
+    fn is_retryable(&self) -> bool {
+        SdkError::is_retryable(self)
+    }
+
+    fn retry_after(&self) -> Option<std::time::Duration> {
+        SdkError::retry_after(self)
+    }
+
+    fn circuit_open() -> Self {
+        SdkError::CircuitOpen(
+            "circuit breaker stayed open for the entire retry window; no request was sent"
+                .to_string(),
+        )
+    }
+}
+
 fn streaming_execution_error(error: xybrid_core::runtime_adapter::AdapterError) -> SdkError {
     match error {
         xybrid_core::runtime_adapter::AdapterError::AbortedForCloudFallback { reason } => {
             SdkError::AbortedForCloudFallback { reason }
         }
-        other => SdkError::InferenceError(format!("Streaming execution failed: {}", other)),
+        other => SdkError::inference_src("Streaming execution failed", other),
     }
 }
 
@@ -171,7 +336,7 @@ fn streaming_callback_error(error: Box<dyn std::error::Error + Send + Sync>) -> 
     if let Some(reason) = xybrid_core::abort::cloud_fallback_reason_from_error(error.as_ref()) {
         return SdkError::AbortedForCloudFallback { reason };
     }
-    SdkError::InferenceError(format!("Streaming callback failed: {}", error))
+    SdkError::inference_src("Streaming callback failed", error)
 }
 
 fn streaming_pre_run_abort_error(
@@ -183,7 +348,27 @@ fn streaming_pre_run_abort_error(
             reason: reason.to_core_abort_reason(),
         };
     }
-    SdkError::InferenceError(format!("Execution aborted: {reason}"))
+    SdkError::inference(format!("Execution aborted: {reason}"))
+}
+
+/// Stamp the live-capture tag onto a telemetry-event `data` object.
+///
+/// When `live_tag` is `Some`, inserts the flat `live_mode = true` +
+/// `frame_session_id = <uuid>` fields that `convert_to_platform_event` hoists
+/// to the wire payload top level and the dispatch funnel uses to rate-limit per
+/// session. When `None` (every non-live run), `data` is left **byte-for-byte
+/// unchanged** so the existing telemetry path is unaffected.
+fn stamp_live_mode_tag(data: &mut serde_json::Value, live_tag: Option<&LiveModeTag>) {
+    let Some(tag) = live_tag else {
+        return;
+    };
+    if let Some(obj) = data.as_object_mut() {
+        obj.insert("live_mode".to_string(), serde_json::json!(true));
+        obj.insert(
+            "frame_session_id".to_string(),
+            serde_json::json!(tag.frame_session_id),
+        );
+    }
 }
 
 /// Information about a local→cloud handoff "seam" surfaced by
@@ -206,6 +391,7 @@ pub struct SeamInfo {
 }
 
 const FALLBACK_POLICY_RESOURCE_MAX_AGE: Duration = Duration::from_millis(500);
+const CLOUD_FALLBACK_UNSUPPORTED_TOOLS_REASON: &str = "cloud_fallback_unsupported_tools";
 
 static FALLBACK_AUTHORITY: OnceLock<LocalAuthority> = OnceLock::new();
 
@@ -291,6 +477,7 @@ fn local_reliability_hint_after_abort(
         metrics: metrics.clone(),
         resource_monitor: xybrid_core::device::ResourceMonitor::global(),
         explicit_target: None,
+        local_availability: None,
         device_class: Some(metrics.canonical_device_class()),
         device_class_schema_version: Some(xybrid_core::context::DEVICE_CLASS_SCHEMA_VERSION),
     };
@@ -301,8 +488,10 @@ fn local_reliability_hint_after_abort(
 
 /// Inspect the local-leg result and, on a typed cloud-fallback abort, fire
 /// `on_seam`, retry on the cloud adapter, and return the cloud
-/// [`InferenceResult`]. On any other shape the original result is returned
-/// unchanged.
+/// [`InferenceResult`]. Tool-bearing requests are refused before the cloud leg:
+/// the gateway adapter does not receive [`GenerationConfig`], so forwarding
+/// would silently drop `GenerationConfig::tools`. On any other shape the
+/// original result is returned unchanged.
 ///
 /// `cancellation_token`, when set, makes the cloud retry leg honour
 /// caller-driven cancellation. The cloud leg cannot meaningfully react to
@@ -325,6 +514,7 @@ fn dispatch_after_local<F, S>(
     policy_metrics: xybrid_core::context::DeviceMetrics,
     signal_context: Option<SignalContext>,
     cancellation_token: Option<CancellationToken>,
+    tools_requested: bool,
     on_token: &mut F,
     on_seam: &mut S,
 ) -> SdkResult<InferenceResult>
@@ -367,16 +557,6 @@ where
             };
             on_seam(seam);
 
-            if cancellation_token
-                .as_ref()
-                .is_some_and(CancellationToken::is_cancelled)
-            {
-                return Err(SdkError::InferenceError(format!(
-                    "Execution aborted: {}",
-                    crate::run_options::AbortReason::UserCancelled
-                )));
-            }
-
             // FR-6: reuse the original prompt; no partial-token reuse.
             let cloud_envelope = envelope.clone();
             let cloud_provider = cloud_envelope.metadata.get("provider").cloned();
@@ -396,6 +576,46 @@ where
                 .get("model")
                 .map(|s| s.as_str())
                 .unwrap_or(model_id);
+            if cancellation_token
+                .as_ref()
+                .is_some_and(CancellationToken::is_cancelled)
+            {
+                return Err(SdkError::inference(format!(
+                    "Execution aborted: {}",
+                    crate::run_options::AbortReason::UserCancelled
+                )));
+            }
+
+            // Tool-bearing requests fail closed before policy or cloud
+            // dispatch (after the cancellation check — user intent wins over
+            // the capability error when both apply).
+            if tools_requested {
+                crate::telemetry::publish_cloud_denied_by_policy(
+                    &correlation_id,
+                    cloud_model_id,
+                    reason,
+                    CLOUD_FALLBACK_UNSUPPORTED_TOOLS_REASON,
+                    local_latency_ms,
+                );
+                record_cloud_outcome(
+                    authority,
+                    cloud_model_id,
+                    cloud_provider.as_deref(),
+                    0,
+                    false,
+                    Some(CLOUD_FALLBACK_UNSUPPORTED_TOOLS_REASON.to_string()),
+                    OutcomeCategory::HardFail {
+                        reason: CLOUD_FALLBACK_UNSUPPORTED_TOOLS_REASON.to_string(),
+                    },
+                    signal_context,
+                );
+                return Err(SdkError::inference(
+                    "cloud fallback is not available for tool-calling requests: tools are not \
+                     forwarded to the gateway yet; run tool-calling requests local-only or drop \
+                     `tools` to allow fallback",
+                ));
+            }
+
             let policy_decision = authority.apply_policy(&PolicyRequest {
                 stage_id: cloud_model_id.to_string(),
                 envelope: cloud_envelope.clone(),
@@ -425,7 +645,7 @@ where
                         },
                         signal_context,
                     );
-                    return Err(SdkError::InferenceError(format!(
+                    return Err(SdkError::inference(format!(
                         "cloud_denied_by_policy: {}",
                         policy_reason
                     )));
@@ -459,7 +679,7 @@ where
                         },
                         signal_context,
                     );
-                    return Err(SdkError::InferenceError(format!(
+                    return Err(SdkError::inference(format!(
                         "cloud_denied_by_policy: {}",
                         policy_reason
                     )));
@@ -620,20 +840,30 @@ struct ModelHandle {
 ///
 /// # Example (Recommended - Registry-based)
 ///
-/// ```ignore
+/// ```no_run
+/// # fn _example() -> Result<(), Box<dyn std::error::Error>> {
+/// # use xybrid_sdk::ModelLoader;
+/// # use xybrid_sdk::ir::Envelope;
+/// # let envelope: Envelope = unimplemented!();
 /// // Load using registry (recommended - auto-resolves to best variant)
 /// let loader = ModelLoader::from_registry("kokoro-82m");
 /// let model = loader.load()?;
-/// let result = model.run(&envelope)?;
+/// let result = model.run(&envelope, None)?;
+/// # Ok(())
+/// # }
 /// ```
 ///
 /// # Example (With progress callback)
 ///
-/// ```ignore
+/// ```no_run
+/// # fn _example() -> Result<(), Box<dyn std::error::Error>> {
+/// # use xybrid_sdk::ModelLoader;
 /// let loader = ModelLoader::from_registry("kokoro-82m");
 /// let model = loader.load_with_progress(|progress| {
 ///     println!("Download: {:.1}%", progress * 100.0);
 /// })?;
+/// # Ok(())
+/// # }
 /// ```
 /// GGUF quantization preference order for automatic selection.
 /// Q4_K_M is the default — best quality/size tradeoff for edge devices.
@@ -655,7 +885,7 @@ fn select_gguf_variant(gguf_files: &[&str], variant: Option<&str>) -> SdkResult<
         {
             return Ok(found.to_string());
         }
-        return Err(SdkError::LoadError(format!(
+        return Err(SdkError::load(format!(
             "No GGUF file matching variant '{}'. Available: {}",
             v,
             gguf_files.join(", ")
@@ -672,7 +902,7 @@ fn select_gguf_variant(gguf_files: &[&str], variant: Option<&str>) -> SdkResult<
     // Fallback: pick the smallest file (likely the most quantized)
     Ok(gguf_files
         .first()
-        .ok_or_else(|| SdkError::LoadError("No GGUF files found".to_string()))?
+        .ok_or_else(|| SdkError::load("No GGUF files found"))?
         .to_string())
 }
 
@@ -681,6 +911,19 @@ pub struct ModelLoader {
     source: ModelSource,
     model_id: Option<String>,
     version: Option<String>,
+    /// Per-load speculative-cloud override. `None` inherits the process-global
+    /// default set via [`crate::set_speculative_cloud`].
+    speculative_cloud: Option<bool>,
+}
+
+/// Whether a cloud gateway API key can be resolved right now.
+///
+/// Covers the in-memory key set via [`crate::set_api_key`] and the
+/// `XYBRID_API_KEY` environment variable. Forwards to [`crate::has_api_key`],
+/// which checks presence without constructing a `CloudConfig` or cloning the
+/// key.
+fn cloud_api_key_present() -> bool {
+    crate::has_api_key()
 }
 
 impl ModelLoader {
@@ -691,30 +934,40 @@ impl ModelLoader {
     /// caching and SHA256 verification.
     ///
     /// # Example
-    /// ```ignore
+    /// ```no_run
+    /// # fn _example() -> Result<(), Box<dyn std::error::Error>> {
+    /// # use xybrid_sdk::ModelLoader;
     /// let loader = ModelLoader::from_registry("kokoro-82m");
     /// let model = loader.load()?;
+    /// # Ok(())
+    /// # }
     /// ```
     pub fn from_registry(id: &str) -> Self {
         Self {
             source: ModelSource::registry(id),
             model_id: Some(id.to_string()),
             version: None, // Version is resolved by registry API
+            speculative_cloud: None,
         }
     }
 
     /// Create loader from registry with explicit platform.
     ///
     /// # Example
-    /// ```ignore
+    /// ```no_run
+    /// # fn _example() -> Result<(), Box<dyn std::error::Error>> {
+    /// # use xybrid_sdk::ModelLoader;
     /// let loader = ModelLoader::from_registry_with_platform("kokoro-82m", "macos-arm64");
     /// let model = loader.load()?;
+    /// # Ok(())
+    /// # }
     /// ```
     pub fn from_registry_with_platform(id: &str, platform: &str) -> Self {
         Self {
             source: ModelSource::registry_with_platform(id, platform),
             model_id: Some(id.to_string()),
             version: None,
+            speculative_cloud: None,
         }
     }
 
@@ -729,6 +982,7 @@ impl ModelLoader {
             source: ModelSource::legacy_registry(url, model_id, version),
             model_id: Some(model_id.to_string()),
             version: Some(version.to_string()),
+            speculative_cloud: None,
         }
     }
 
@@ -751,6 +1005,7 @@ impl ModelLoader {
             source: ModelSource::legacy_registry_with_platform(url, model_id, version, platform),
             model_id: Some(model_id.to_string()),
             version: Some(version.to_string()),
+            speculative_cloud: None,
         }
     }
 
@@ -767,6 +1022,7 @@ impl ModelLoader {
             source: ModelSource::bundle(path),
             model_id: None,
             version: None,
+            speculative_cloud: None,
         })
     }
 
@@ -800,6 +1056,7 @@ impl ModelLoader {
             source: ModelSource::directory(path),
             model_id: None,
             version: None,
+            speculative_cloud: None,
         })
     }
 
@@ -815,30 +1072,40 @@ impl ModelLoader {
     /// `SdkError::ConfigError` if the feature is not enabled.
     ///
     /// # Example
-    /// ```ignore
+    /// ```no_run
+    /// # fn _example() -> Result<(), Box<dyn std::error::Error>> {
+    /// # use xybrid_sdk::ModelLoader;
     /// let loader = ModelLoader::from_huggingface("xybrid-ai/kokoro-82m");
     /// let model = loader.load()?;
+    /// # Ok(())
+    /// # }
     /// ```
     pub fn from_huggingface(repo: &str) -> Self {
         Self {
             source: ModelSource::huggingface(repo),
             model_id: Some(repo.to_string()),
             version: None,
+            speculative_cloud: None,
         }
     }
 
     /// Create loader from a HuggingFace Hub repository with explicit revision.
     ///
     /// # Example
-    /// ```ignore
-    /// let loader = ModelLoader::from_huggingface_with_revision("xybrid-ai/kokoro-82m", "v1.0")?;
+    /// ```no_run
+    /// # fn _example() -> Result<(), Box<dyn std::error::Error>> {
+    /// # use xybrid_sdk::ModelLoader;
+    /// let loader = ModelLoader::from_huggingface_with_revision("xybrid-ai/kokoro-82m", "v1.0");
     /// let model = loader.load()?;
+    /// # Ok(())
+    /// # }
     /// ```
     pub fn from_huggingface_with_revision(repo: &str, revision: &str) -> Self {
         Self {
             source: ModelSource::huggingface_with_revision(repo, revision),
             model_id: Some(repo.to_string()),
             version: Some(revision.to_string()),
+            speculative_cloud: None,
         }
     }
 
@@ -848,9 +1115,13 @@ impl ModelLoader {
     /// Without a variant, defaults to Q4_K_M for GGUF repos.
     ///
     /// # Example
-    /// ```ignore
+    /// ```no_run
+    /// # fn _example() -> Result<(), Box<dyn std::error::Error>> {
+    /// # use xybrid_sdk::ModelLoader;
     /// let loader = ModelLoader::from_huggingface_parsed("LiquidAI/LFM2.5-350M-GGUF:Q8_0");
     /// let model = loader.load()?;
+    /// # Ok(())
+    /// # }
     /// ```
     pub fn from_huggingface_parsed(input: &str) -> Self {
         let source = ModelSource::parse_huggingface(input);
@@ -859,6 +1130,7 @@ impl ModelLoader {
             source,
             model_id: Some(repo),
             version: None,
+            speculative_cloud: None,
         }
     }
 
@@ -875,6 +1147,84 @@ impl ModelLoader {
     /// Get the source type.
     pub fn source_type(&self) -> &'static str {
         self.source.source_type()
+    }
+
+    /// Prefer the cloud while this model downloads, for this load only.
+    ///
+    /// Overrides the process-global default set via
+    /// [`crate::set_speculative_cloud`]. When the gate in
+    /// [`Self::will_speculate`] is satisfied, the first run is served from the
+    /// Xybrid gateway while the local weights download in the background,
+    /// instead of blocking on the download. Has no effect for already-local
+    /// sources (bundle/directory).
+    ///
+    /// # Examples
+    /// ```
+    /// use xybrid_sdk::ModelLoader;
+    /// let loader = ModelLoader::from_registry("qwen2.5-0.5b-instruct")
+    ///     .with_speculative_cloud(true);
+    /// assert_eq!(loader.speculative_cloud_override(), Some(true));
+    /// ```
+    pub fn with_speculative_cloud(mut self, enabled: bool) -> Self {
+        self.speculative_cloud = Some(enabled);
+        self
+    }
+
+    /// The per-load speculative-cloud override, if one was set.
+    ///
+    /// `None` means this loader inherits the global default
+    /// ([`crate::is_speculative_cloud_enabled`]).
+    pub fn speculative_cloud_override(&self) -> Option<bool> {
+        self.speculative_cloud
+    }
+
+    /// Whether this load would serve from the cloud while the model downloads.
+    ///
+    /// True only when all three hold: speculation is enabled (per-load override
+    /// or global default), a cloud API key is resolvable, and the model is not
+    /// already extracted in the local cache. Only registry sources can be
+    /// "not yet downloaded"; bundle, directory, and HuggingFace loads are
+    /// treated as already-local and never speculate.
+    ///
+    /// Performs a local cache lookup only — it never touches the network.
+    ///
+    /// # Examples
+    /// ```no_run
+    /// use xybrid_sdk::ModelLoader;
+    /// let loader = ModelLoader::from_registry("qwen2.5-0.5b-instruct")
+    ///     .with_speculative_cloud(true);
+    /// if loader.will_speculate() {
+    ///     // Not cached locally and a key is set: this load is served from the
+    ///     // cloud while the download runs in the background.
+    /// }
+    /// ```
+    pub fn will_speculate(&self) -> bool {
+        // Short-circuit: skip the API-key lookup and the local-cache disk check
+        // when speculation is disabled (the default).
+        self.speculative_enabled() && cloud_api_key_present() && !self.is_extracted_locally()
+    }
+
+    /// Resolve the speculative-cloud preference: the per-load override if set,
+    /// otherwise the process-global default.
+    pub(crate) fn speculative_enabled(&self) -> bool {
+        self.speculative_cloud
+            .unwrap_or_else(crate::is_speculative_cloud_enabled)
+    }
+
+    /// Whether a ready-to-run copy of this model is already extracted locally.
+    ///
+    /// Local cache check only; never hits the network. Non-registry sources are
+    /// reported as already-local so they never trigger speculation.
+    fn is_extracted_locally(&self) -> bool {
+        match &self.source {
+            ModelSource::Registry { id, .. } => {
+                // A local cache check only — instantiate `CacheManager` directly
+                // rather than `RegistryClient::from_env()`, which would spin up
+                // an HTTP agent and circuit breakers we don't need here.
+                CacheManager::new().is_ok_and(|cache| cache.is_extracted(id))
+            }
+            _ => true,
+        }
     }
 
     /// Load the model into memory (synchronous).
@@ -897,10 +1247,15 @@ impl ModelLoader {
     /// Only applies to registry-based loading (downloads from HuggingFace).
     ///
     /// # Example
-    /// ```ignore
+    /// ```no_run
+    /// # fn _example() -> Result<(), Box<dyn std::error::Error>> {
+    /// # use xybrid_sdk::ModelLoader;
+    /// # let loader: ModelLoader = unimplemented!();
     /// let model = loader.load_with_progress(|progress| {
     ///     println!("Download: {:.1}%", progress * 100.0);
     /// })?;
+    /// # Ok(())
+    /// # }
     /// ```
     #[allow(deprecated)]
     pub fn load_with_progress<F>(&self, progress_callback: F) -> SdkResult<XybridModel>
@@ -938,7 +1293,7 @@ impl ModelLoader {
         let loader = self.clone();
         tokio::task::spawn_blocking(move || loader.load())
             .await
-            .map_err(|e| SdkError::LoadError(format!("Task join error: {}", e)))?
+            .map_err(|e| SdkError::load_src("Task join error", e))?
     }
 
     /// Load model from registry using RegistryClient.
@@ -992,7 +1347,7 @@ impl ModelLoader {
         // Use blocking HTTP client
         let response = ureq::get(&bundle_url)
             .call()
-            .map_err(|e| SdkError::NetworkError(format!("Failed to download bundle: {}", e)))?;
+            .map_err(|e| SdkError::network_src("Failed to download bundle", e))?;
 
         if response.status() != 200 {
             return Err(SdkError::ModelNotFound(format!(
@@ -1013,7 +1368,7 @@ impl ModelLoader {
 
     fn load_from_bundle(&self, path: &PathBuf) -> SdkResult<XybridModel> {
         // Use CacheManager for unified extraction (single source of truth)
-        let cache = crate::cache::CacheManager::new()?;
+        let cache = CacheManager::new()?;
         let extract_dir = cache.ensure_extracted(path)?;
 
         // Load from extracted directory (extraction is permanent in cache)
@@ -1030,6 +1385,7 @@ impl ModelLoader {
             version,
             output_type,
             supports_streaming,
+            current_run: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -1048,10 +1404,15 @@ impl ModelLoader {
     where
         F: Fn(f32),
     {
-        use hf_hub::{api::sync::Api, Repo, RepoType};
+        use hf_hub::{api::sync::ApiBuilder, Repo, RepoType};
 
         // Determine our cache directory
-        let cache_dir = Self::hf_cache_dir(repo)?;
+        let cache_layout = CacheManager::layout_from_config()?;
+        let cache_dir = cache_layout
+            .huggingface_repo_dirs(repo)
+            .into_iter()
+            .find(|dir| dir.join("model_metadata.json").exists())
+            .unwrap_or_else(|| cache_layout.huggingface_repo_dir(repo));
 
         // Check if we already have a cached copy with model_metadata.json
         let metadata_path = cache_dir.join("model_metadata.json");
@@ -1063,9 +1424,10 @@ impl ModelLoader {
         log::info!(target: "xybrid_sdk", "Downloading model from HuggingFace: {}", repo);
 
         // Create HF API client
-        let api = Api::new().map_err(|e| {
-            SdkError::NetworkError(format!("Failed to create HuggingFace API client: {}", e))
-        })?;
+        let api = ApiBuilder::from_env()
+            .with_cache_dir(cache_layout.preferred_huggingface_hub_root(repo))
+            .build()
+            .map_err(|e| SdkError::network_src("Failed to create HuggingFace API client", e))?;
 
         // Create repo reference with optional revision
         let hf_repo = if let Some(rev) = revision {
@@ -1077,15 +1439,15 @@ impl ModelLoader {
 
         // Get repo info to list all files
         let repo_info = repo_api.info().map_err(|e| {
-            SdkError::NetworkError(format!(
-                "Failed to get HuggingFace repo info for '{}': {}",
-                repo, e
-            ))
+            SdkError::network_src(
+                format!("Failed to get HuggingFace repo info for '{}'", repo),
+                e,
+            )
         })?;
 
         let siblings = repo_info.siblings;
         if siblings.is_empty() {
-            return Err(SdkError::LoadError(format!(
+            return Err(SdkError::load(format!(
                 "HuggingFace repo '{}' has no files",
                 repo
             )));
@@ -1153,10 +1515,10 @@ impl ModelLoader {
 
             // Download file (hf-hub caches internally)
             let cached_path = repo_api.get(filename).map_err(|e| {
-                SdkError::NetworkError(format!(
-                    "Failed to download '{}' from '{}': {}",
-                    filename, repo, e
-                ))
+                SdkError::network_src(
+                    format!("Failed to download '{}' from '{}'", filename, repo),
+                    e,
+                )
             })?;
 
             // Create target path in our cache directory
@@ -1245,24 +1607,6 @@ impl ModelLoader {
         ))
     }
 
-    /// Get the cache directory for a HuggingFace repo.
-    ///
-    /// Returns `~/.xybrid/cache/hf/{sanitized_repo}/` or the SDK-configured cache path.
-    fn hf_cache_dir(repo: &str) -> SdkResult<PathBuf> {
-        let base_cache = if let Some(sdk_cache) = crate::get_sdk_cache_dir() {
-            sdk_cache.join("hf")
-        } else {
-            let home = dirs::home_dir().ok_or_else(|| {
-                SdkError::CacheError("Cannot determine home directory".to_string())
-            })?;
-            home.join(".xybrid").join("cache").join("hf")
-        };
-
-        // Sanitize repo name for filesystem (e.g., "xybrid-ai/kokoro-82m" -> "xybrid-ai--kokoro-82m")
-        let sanitized = repo.replace('/', "--");
-        Ok(base_cache.join(sanitized))
-    }
-
     /// Check if a file is essential and should always be downloaded.
     ///
     /// Essential files are model files (.gguf, .onnx, .safetensors), metadata files
@@ -1310,17 +1654,17 @@ impl ModelLoader {
             version,
             output_type,
             supports_streaming,
+            current_run: Arc::new(Mutex::new(None)),
         })
     }
 
     fn create_model_handle(model_dir: &PathBuf) -> SdkResult<ModelHandle> {
         // Load metadata
         let metadata_path = model_dir.join("model_metadata.json");
-        let metadata_str = std::fs::read_to_string(&metadata_path).map_err(|e| {
-            SdkError::LoadError(format!("Failed to read model_metadata.json: {}", e))
-        })?;
+        let metadata_str = std::fs::read_to_string(&metadata_path)
+            .map_err(|e| SdkError::load_src("Failed to read model_metadata.json", e))?;
         let metadata: ModelMetadata = serde_json::from_str(&metadata_str)
-            .map_err(|e| SdkError::LoadError(format!("Failed to parse metadata: {}", e)))?;
+            .map_err(|e| SdkError::load_src("Failed to parse metadata", e))?;
 
         // Create executor with base path
         let executor = TemplateExecutor::with_base_path(model_dir.to_str().unwrap_or("."));
@@ -1407,11 +1751,17 @@ impl ModelLoader {
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```no_run
+/// # fn _example() -> Result<(), Box<dyn std::error::Error>> {
+/// # use xybrid_sdk::{ModelLoader, StreamConfig};
+/// # use xybrid_sdk::ir::Envelope;
+/// # let loader: ModelLoader = unimplemented!();
+/// # let audio_envelope: Envelope = unimplemented!();
+/// # let samples: Vec<f32> = vec![];
 /// let model = loader.load()?;
 ///
 /// // Batch inference
-/// let result = model.run(&audio_envelope)?;
+/// let result = model.run(&audio_envelope, None)?;
 /// println!("Transcription: {}", result.unwrap_text());
 ///
 /// // Streaming inference (if supported)
@@ -1423,6 +1773,8 @@ impl ModelLoader {
 ///
 /// // Cleanup
 /// model.unload()?;
+/// # Ok(())
+/// # }
 /// ```
 pub struct XybridModel {
     handle: Arc<RwLock<ModelHandle>>,
@@ -1430,6 +1782,61 @@ pub struct XybridModel {
     version: String,
     output_type: OutputType,
     supports_streaming: bool,
+    /// In-flight cancellation token for the preemptive cancel-and-replace
+    /// ("latest-frame-wins") streaming slot. Guarded by its **own** mutex,
+    /// deliberately separate from `handle`'s write lock: a preempting start
+    /// swaps the new token into this slot and cancels the old one *before*
+    /// acquiring `handle.write()`, so the previous run halts at its next token
+    /// and drops the write guard promptly instead of head-of-line blocking the
+    /// new run. `current_run.lock()` is only ever held for the brief swap — it
+    /// is never held across `handle.write()`, so the two locks cannot deadlock.
+    /// Non-preempting callers (chat) never touch this slot.
+    ///
+    /// `Arc`-shared so all clones of a model (the FFI clones the model into
+    /// each streaming worker thread) coordinate through one slot — preemption
+    /// must see the previous concurrent run's token even though it ran on a
+    /// different clone.
+    current_run: Arc<Mutex<Option<CancellationToken>>>,
+}
+
+struct WarmupEventFields {
+    model_id: String,
+    version: String,
+    output_type: OutputType,
+}
+
+fn cap_warmup_generation(mut warmup_input: Envelope) -> Envelope {
+    warmup_input
+        .metadata
+        .insert("max_tokens".to_string(), "1".to_string());
+    warmup_input
+}
+
+fn publish_model_warmup_event(
+    fields: WarmupEventFields,
+    latency_ms: u32,
+    resource_guard: xybrid_core::device::RunGuard,
+) {
+    let event = crate::telemetry::TelemetryEvent {
+        event_type: "ModelWarmup".to_string(),
+        stage_name: Some(fields.model_id.clone()),
+        target: Some("local".to_string()),
+        latency_ms: Some(latency_ms),
+        error: None,
+        data: Some(
+            serde_json::json!({
+                "model_id": fields.model_id,
+                "version": fields.version,
+                "output_type": format!("{:?}", fields.output_type),
+            })
+            .to_string(),
+        ),
+        timestamp_ms: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0),
+    };
+    crate::telemetry::publish_with_resource_summary(event, resource_guard);
 }
 
 impl XybridModel {
@@ -1446,6 +1853,20 @@ impl XybridModel {
     /// Check if the model is currently loaded.
     pub fn is_loaded(&self) -> bool {
         self.handle.read().map(|h| h.loaded).unwrap_or(false)
+    }
+
+    /// Whether the model bundle declares local tool-calling support.
+    ///
+    /// Advisory tri-state from the bundle's optional `tool_calling` metadata
+    /// flag: `None` means the bundle says nothing, `Some(true)`/`Some(false)`
+    /// are explicit declarations. Use it to gate tool UI; enforcement stays
+    /// at run time (a tools-bearing request against an unsupporting template
+    /// fails as invalid input regardless of this flag).
+    pub fn supports_tool_calling(&self) -> Option<bool> {
+        self.handle
+            .read()
+            .ok()
+            .and_then(|h| h.metadata.supports_tool_calling())
     }
 
     /// Check if this model supports streaming.
@@ -1465,13 +1886,18 @@ impl XybridModel {
     ///
     /// # Example
     ///
-    /// ```ignore
+    /// ```no_run
+    /// # fn _example() -> Result<(), Box<dyn std::error::Error>> {
+    /// # use xybrid_sdk::{ModelLoader, ConversationContext};
+    /// # let loader: ModelLoader = unimplemented!();
     /// let model = loader.load()?;
     /// if model.is_llm() {
     ///     // Create conversation context for multi-turn chat
     ///     let mut ctx = ConversationContext::new();
     ///     // ... manage conversation history
     /// }
+    /// # Ok(())
+    /// # }
     /// ```
     pub fn is_llm(&self) -> bool {
         self.handle
@@ -1506,7 +1932,9 @@ impl XybridModel {
     ///
     /// # Example
     ///
-    /// ```ignore
+    /// ```no_run
+    /// # use xybrid_sdk::XybridModel;
+    /// # let model: XybridModel = unimplemented!();
     /// if let Some(voices) = model.voices() {
     ///     for voice in voices {
     ///         println!("{}: {} ({})", voice.id, voice.name, voice.language.unwrap_or_default());
@@ -1559,12 +1987,19 @@ impl XybridModel {
     ///
     /// # Example
     ///
-    /// ```ignore
+    /// ```no_run
+    /// # fn _example() -> Result<(), Box<dyn std::error::Error>> {
+    /// # use xybrid_sdk::ModelLoader;
+    /// # use xybrid_sdk::ir::Envelope;
+    /// # let loader: ModelLoader = unimplemented!();
+    /// # let envelope: Envelope = unimplemented!();
     /// let model = loader.load()?;
     /// model.warmup()?;  // Pre-load model
     ///
     /// // First inference is now fast
-    /// let result = model.run(&envelope)?;
+    /// let result = model.run(&envelope, None)?;
+    /// # Ok(())
+    /// # }
     /// ```
     pub fn warmup(&self) -> SdkResult<()> {
         use xybrid_core::ir::EnvelopeKind;
@@ -1596,16 +2031,54 @@ impl XybridModel {
             },
         };
 
-        // Run inference (this loads the model)
+        // Warmup measures model-load + first-token latency, not full
+        // generation. Cap LLM decoding at 1 token so a 2048-token
+        // `GenerationConfig::default()` doesn't turn warmup into a real
+        // inference. `executor::execute_llm` reads this from envelope
+        // metadata when no explicit `GenerationConfig` is passed;
+        // non-LLM paths ignore it.
+        let warmup_input = cap_warmup_generation(warmup_input);
+
+        // Run the inference inline (rather than delegating to `self.run`)
+        // so the publish at the end is a `ModelWarmup` event rather than
+        // a `ModelComplete`. Warmups should be visible to billing /
+        // perf-debugging but distinguishable from real inferences on
+        // the Traces dashboard — `ModelWarmup` carries the same
+        // attribution fields (`stage_name`, `target`, `latency_ms`) but
+        // its own event_type so the platform can render with a `warmup`
+        // badge and default-filter it out of cost-attribution rollups.
         let start = Instant::now();
-        let _ = self.run(&warmup_input, None)?;
-        let elapsed = start.elapsed();
+        let resource_guard = crate::telemetry::begin_resource_run();
+        let trace_id = uuid::Uuid::new_v4();
+        let _telemetry_ctx =
+            crate::telemetry::TelemetryPipelineContextGuard::install(None, Some(trace_id));
+
+        let event_fields = {
+            let mut handle = self.handle.write().unwrap_or_else(|e| e.into_inner());
+            if !handle.loaded {
+                return Err(SdkError::NotLoaded);
+            }
+            let metadata = handle.metadata.clone();
+            handle
+                .executor
+                .execute(&metadata, &warmup_input, None)
+                .map_err(|e| SdkError::inference_src("Warmup execution failed", e))?;
+
+            WarmupEventFields {
+                model_id: self.model_id.clone(),
+                version: metadata.version,
+                output_type: self.output_type,
+            }
+        };
+
+        let latency_ms = start.elapsed().as_millis() as u32;
+        publish_model_warmup_event(event_fields, latency_ms, resource_guard);
 
         log::info!(
             target: "xybrid_sdk",
-            "Model {} warmed up in {:?}",
+            "Model {} warmed up in {}ms",
             self.model_id,
-            elapsed
+            latency_ms
         );
 
         Ok(())
@@ -1617,7 +2090,10 @@ impl XybridModel {
     ///
     /// # Example
     ///
-    /// ```ignore
+    /// ```no_run
+    /// # async fn _example() -> Result<(), Box<dyn std::error::Error>> {
+    /// # use xybrid_sdk::ModelLoader;
+    /// # let loader: ModelLoader = unimplemented!();
     /// let model = loader.load()?;
     ///
     /// // Start warmup in background
@@ -1629,6 +2105,8 @@ impl XybridModel {
     ///
     /// // Wait for warmup if needed
     /// warmup_handle.await??;
+    /// # Ok(())
+    /// # }
     /// ```
     pub async fn warmup_async(&self) -> SdkResult<()> {
         let handle = self.handle.clone();
@@ -1662,32 +2140,53 @@ impl XybridModel {
                 },
             };
 
+            // See sync `warmup()` for rationale — cap LLM decoding at
+            // 1 token so warmup doesn't run a full generation.
+            let warmup_input = cap_warmup_generation(warmup_input);
+
             let start = Instant::now();
+            let resource_guard = crate::telemetry::begin_resource_run();
+            let trace_id = uuid::Uuid::new_v4();
+            let _telemetry_ctx =
+                crate::telemetry::TelemetryPipelineContextGuard::install(None, Some(trace_id));
 
-            // Run inference
-            let mut guard = handle.write().unwrap_or_else(|e| e.into_inner());
-            if !guard.loaded {
-                return Err(SdkError::NotLoaded);
-            }
+            // Run inference inline and publish a `ModelWarmup` event —
+            // same shape as the sync `warmup()` above. Previously this
+            // path published nothing at all, so async warmups were
+            // silent on the wire (visible only via logs).
+            let event_fields = {
+                let mut guard = handle.write().unwrap_or_else(|e| e.into_inner());
+                if !guard.loaded {
+                    return Err(SdkError::NotLoaded);
+                }
 
-            let metadata = guard.metadata.clone();
-            let _ = guard
-                .executor
-                .execute(&metadata, &warmup_input, None)
-                .map_err(|e| SdkError::InferenceError(format!("Warmup failed: {}", e)))?;
+                let metadata = guard.metadata.clone();
+                guard
+                    .executor
+                    .execute(&metadata, &warmup_input, None)
+                    .map_err(|e| SdkError::inference_src("Warmup failed", e))?;
 
-            let elapsed = start.elapsed();
+                WarmupEventFields {
+                    model_id: model_id.clone(),
+                    version: metadata.version,
+                    output_type,
+                }
+            };
+
+            let latency_ms = start.elapsed().as_millis() as u32;
+            publish_model_warmup_event(event_fields, latency_ms, resource_guard);
+
             log::info!(
                 target: "xybrid_sdk",
-                "Model {} warmed up (async) in {:?}",
+                "Model {} warmed up (async) in {}ms",
                 model_id,
-                elapsed
+                latency_ms
             );
 
             Ok(())
         })
         .await
-        .map_err(|e| SdkError::InferenceError(format!("Task join error: {}", e)))?
+        .map_err(|e| SdkError::inference_src("Task join error", e))?
     }
 
     /// Create a minimal WAV file bytes from samples for warmup.
@@ -1736,6 +2235,7 @@ impl XybridModel {
         envelope: &Envelope,
         config: Option<&GenerationConfig>,
     ) -> SdkResult<InferenceResult> {
+        crate::telemetry::maybe_emit_dev_nudge();
         let start = Instant::now();
         // Begin a resource-telemetry scope for this run. When
         // `resource_telemetry_mode()` is `Off` the guard is a no-op; otherwise
@@ -1765,7 +2265,7 @@ impl XybridModel {
         let output = handle
             .executor
             .execute(&metadata, envelope, config)
-            .map_err(|e| SdkError::InferenceError(format!("Execution failed: {}", e)))?;
+            .map_err(|e| sdk_execution_error("Execution failed", e))?;
 
         let latency_ms = start.elapsed().as_millis() as u32;
 
@@ -1797,6 +2297,82 @@ impl XybridModel {
         Ok(InferenceResult::new(output, &self.model_id, latency_ms))
     }
 
+    /// Streaming TTS: synthesize `envelope`'s text sentence-chunk by
+    /// sentence-chunk and hand each chunk's PCM (with its sample rate) to
+    /// `on_chunk` as it is produced, instead of returning one batched WAV. For
+    /// long text this lets playback start after the first sentence.
+    ///
+    /// Audio rides the callback; there is no batched return value. `on_chunk`
+    /// returning `false` stops early, as does a cancelled
+    /// `options.cancellation_token` — both honored at the next chunk boundary
+    /// (one chunk's ONNX forward is uninterruptible). The model write-lock is
+    /// held for the whole synthesis, exactly like [`run`].
+    pub fn run_tts_streaming<F>(
+        &self,
+        envelope: &Envelope,
+        options: &RunOptions,
+        mut on_chunk: F,
+    ) -> SdkResult<()>
+    where
+        F: FnMut(Vec<u8>, u32) -> bool,
+    {
+        crate::telemetry::maybe_emit_dev_nudge();
+        let start = Instant::now();
+        let resource_guard = crate::telemetry::begin_resource_run();
+        let trace_id = uuid::Uuid::new_v4();
+        let _telemetry_ctx =
+            crate::telemetry::TelemetryPipelineContextGuard::install(None, Some(trace_id));
+
+        let mut handle = self.handle.write().unwrap_or_else(|e| e.into_inner());
+        if !handle.loaded {
+            return Err(SdkError::NotLoaded);
+        }
+        let metadata = handle.metadata.clone();
+
+        // Between-chunk cancellation: a chunk's ONNX forward can't be aborted
+        // mid-way, so the token (and the caller's `on_chunk`) is consulted at
+        // chunk boundaries.
+        let cancel = options.cancellation_token.clone();
+        let mut adapter = |pcm: Vec<u8>, sample_rate: u32| -> bool {
+            if let Some(token) = &cancel {
+                if token.is_cancelled() {
+                    return false;
+                }
+            }
+            on_chunk(pcm, sample_rate)
+        };
+
+        handle
+            .executor
+            .execute_tts_streaming(&metadata, envelope, &mut adapter)
+            .map_err(|e| sdk_execution_error("TTS streaming failed", e))?;
+
+        let latency_ms = start.elapsed().as_millis() as u32;
+        let event = crate::telemetry::TelemetryEvent {
+            event_type: "ModelComplete".to_string(),
+            stage_name: Some(self.model_id.clone()),
+            target: Some("local".to_string()),
+            latency_ms: Some(latency_ms),
+            error: None,
+            data: Some(
+                serde_json::json!({
+                    "model_id": self.model_id,
+                    "version": self.version,
+                    "output_type": format!("{:?}", self.output_type),
+                    "streaming": true,
+                })
+                .to_string(),
+            ),
+            timestamp_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
+        };
+        crate::telemetry::publish_with_resource_summary(event, resource_guard);
+
+        Ok(())
+    }
+
     /// Run batch inference with per-run controls.
     pub fn run_with_options(
         &self,
@@ -1806,7 +2382,7 @@ impl XybridModel {
         let mut abort_state = AbortState::new(options);
         abort_state
             .check_before_run()
-            .map_err(|reason| SdkError::InferenceError(format!("Execution aborted: {reason}")))?;
+            .map_err(|reason| SdkError::inference(format!("Execution aborted: {reason}")))?;
         self.run(envelope, options.generation_config.as_ref())
     }
 
@@ -1830,10 +2406,12 @@ impl XybridModel {
     ///
     /// # Example
     ///
-    /// ```ignore
-    /// use xybrid_sdk::{ModelLoader, ConversationContext, Envelope, EnvelopeKind, MessageRole};
+    /// ```no_run
+    /// # fn _example() -> Result<(), Box<dyn std::error::Error>> {
+    /// use xybrid_sdk::{ModelLoader, ConversationContext};
+    /// use xybrid_sdk::ir::{Envelope, EnvelopeKind, MessageRole};
     ///
-    /// let model = ModelLoader::from_registry("gemma-3-1b")?.load()?;
+    /// let model = ModelLoader::from_registry("gemma-3-1b").load()?;
     /// let mut ctx = ConversationContext::new();
     ///
     /// // Add user message to context
@@ -1842,12 +2420,14 @@ impl XybridModel {
     /// ctx.push(user_input.clone());
     ///
     /// // Run with context (model sees the full history)
-    /// let result = model.run_with_context(&user_input, &ctx)?;
+    /// let result = model.run_with_context(&user_input, &ctx, None)?;
     ///
     /// // Add assistant response to context
     /// ctx.push(result.envelope().clone());
     ///
     /// println!("{}", result.text().unwrap_or_default());
+    /// # Ok(())
+    /// # }
     /// ```
     pub fn run_with_context(
         &self,
@@ -1880,7 +2460,7 @@ impl XybridModel {
         let output = handle
             .executor
             .execute_with_context(&metadata, envelope, context, config)
-            .map_err(|e| SdkError::InferenceError(format!("Execution failed: {}", e)))?;
+            .map_err(|e| sdk_execution_error("Execution failed", e))?;
 
         let latency_ms = start.elapsed().as_millis() as u32;
 
@@ -1923,7 +2503,7 @@ impl XybridModel {
         let mut abort_state = AbortState::new(options);
         abort_state
             .check_before_run()
-            .map_err(|reason| SdkError::InferenceError(format!("Execution aborted: {reason}")))?;
+            .map_err(|reason| SdkError::inference(format!("Execution aborted: {reason}")))?;
         self.run_with_context(envelope, context, options.generation_config.as_ref())
     }
 
@@ -1944,7 +2524,11 @@ impl XybridModel {
     ///
     /// # Example
     ///
-    /// ```ignore
+    /// ```no_run
+    /// # fn _example() -> Result<(), Box<dyn std::error::Error>> {
+    /// # use xybrid_sdk::{XybridModel, ConversationContext};
+    /// # use xybrid_sdk::ir::{Envelope, EnvelopeKind, MessageRole};
+    /// # let model: XybridModel = unimplemented!();
     /// let mut ctx = ConversationContext::new();
     ///
     /// // Add user message and run with streaming
@@ -1952,7 +2536,7 @@ impl XybridModel {
     ///     .with_role(MessageRole::User);
     /// ctx.push(input.clone());
     ///
-    /// let result = model.run_streaming_with_context(&input, &ctx, |token| {
+    /// let result = model.run_streaming_with_context(&input, &ctx, None, |token| {
     ///     print!("{}", token.token);
     ///     std::io::Write::flush(&mut std::io::stdout())?;
     ///     Ok(())
@@ -1960,12 +2544,36 @@ impl XybridModel {
     ///
     /// // Add assistant response to context
     /// ctx.push(result.envelope().clone());
+    /// # Ok(())
+    /// # }
     /// ```
     pub fn run_streaming_with_context<F>(
         &self,
         envelope: &Envelope,
         context: &ConversationContext,
         config: Option<&GenerationConfig>,
+        on_token: F,
+    ) -> SdkResult<InferenceResult>
+    where
+        F: FnMut(
+                xybrid_core::runtime_adapter::types::PartialToken,
+            ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+            + Send,
+    {
+        // No live-capture tag on the bare context streaming path.
+        self.run_streaming_with_context_tagged(envelope, context, config, None, on_token)
+    }
+
+    /// Internal context-streaming entry point that optionally stamps a
+    /// live-capture telemetry tag onto the emitted `ModelComplete` event. See
+    /// [`Self::run_streaming_tagged`] for the rationale; this is the
+    /// conversation-context variant.
+    fn run_streaming_with_context_tagged<F>(
+        &self,
+        envelope: &Envelope,
+        context: &ConversationContext,
+        config: Option<&GenerationConfig>,
+        live_tag: Option<&LiveModeTag>,
         mut on_token: F,
     ) -> SdkResult<InferenceResult>
     where
@@ -2016,7 +2624,7 @@ impl XybridModel {
             let result = handle
                 .executor
                 .execute_with_context(&metadata, envelope, context, config)
-                .map_err(|e| SdkError::InferenceError(format!("Execution failed: {}", e)))?;
+                .map_err(|e| sdk_execution_error("Execution failed", e))?;
 
             // Extract text from result (if any) and emit as single token
             if let xybrid_core::ir::EnvelopeKind::Text(text) = &result.kind {
@@ -2036,22 +2644,21 @@ impl XybridModel {
         let latency_ms = start.elapsed().as_millis() as u32;
 
         // Emit telemetry event
+        let mut data = serde_json::json!({
+            "model_id": self.model_id,
+            "version": self.version,
+            "output_type": format!("{:?}", self.output_type),
+            "streaming": true,
+            "context_messages": context.history().len(),
+        });
+        stamp_live_mode_tag(&mut data, live_tag);
         let event = crate::telemetry::TelemetryEvent {
             event_type: "ModelComplete".to_string(),
             stage_name: Some(self.model_id.clone()),
             target: Some("local".to_string()),
             latency_ms: Some(latency_ms),
             error: None,
-            data: Some(
-                serde_json::json!({
-                    "model_id": self.model_id,
-                    "version": self.version,
-                    "output_type": format!("{:?}", self.output_type),
-                    "streaming": true,
-                    "context_messages": context.history().len(),
-                })
-                .to_string(),
-            ),
+            data: Some(data.to_string()),
             timestamp_ms: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as u64)
@@ -2088,10 +2695,12 @@ impl XybridModel {
         abort_state
             .check_before_run()
             .map_err(|reason| streaming_pre_run_abort_error(reason, fallback_to_cloud))?;
-        self.run_streaming_with_context(
+        let live_tag = options.live_mode_tag();
+        self.run_streaming_with_context_tagged(
             envelope,
             context,
             options.generation_config.as_ref(),
+            live_tag.as_ref(),
             move |token| {
                 if let Err(reason) = abort_state.check_before_token() {
                     return Err(reason.into_streaming_error(fallback_to_cloud));
@@ -2122,18 +2731,51 @@ impl XybridModel {
     ///
     /// # Example
     ///
-    /// ```ignore
+    /// ```no_run
+    /// # fn _example() -> Result<(), Box<dyn std::error::Error>> {
+    /// # use xybrid_sdk::XybridModel;
+    /// # use xybrid_sdk::ir::Envelope;
+    /// # let model: XybridModel = unimplemented!();
+    /// # let envelope: Envelope = unimplemented!();
     /// // Works for both LLM and non-LLM models
-    /// let result = model.run_streaming(&envelope, |token| {
+    /// let result = model.run_streaming(&envelope, None, |token| {
     ///     print!("{}", token.token);
     ///     std::io::Write::flush(&mut std::io::stdout())?;
     ///     Ok(())
     /// })?;
+    /// # Ok(())
+    /// # }
     /// ```
     pub fn run_streaming<F>(
         &self,
         envelope: &Envelope,
         config: Option<&GenerationConfig>,
+        on_token: F,
+    ) -> SdkResult<InferenceResult>
+    where
+        F: FnMut(
+                xybrid_core::runtime_adapter::types::PartialToken,
+            ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+            + Send,
+    {
+        // No live-capture tag on the bare `run_streaming` path — telemetry is
+        // byte-for-byte the pre-live-mode shape.
+        self.run_streaming_tagged(envelope, config, None, on_token)
+    }
+
+    /// Internal streaming entry point that optionally stamps a live-capture
+    /// telemetry tag onto the emitted `ModelComplete` event.
+    ///
+    /// `run_streaming` delegates here with `live_tag = None` (unchanged wire
+    /// payload). The options-aware streaming entry points pass
+    /// `RunOptions::live_mode_tag()` so live-capture sessions carry
+    /// `live_mode` + `frame_session_id` on the wire, which the telemetry
+    /// dispatch funnel then rate-limits per session.
+    fn run_streaming_tagged<F>(
+        &self,
+        envelope: &Envelope,
+        config: Option<&GenerationConfig>,
+        live_tag: Option<&LiveModeTag>,
         mut on_token: F,
     ) -> SdkResult<InferenceResult>
     where
@@ -2177,7 +2819,7 @@ impl XybridModel {
             let result = handle
                 .executor
                 .execute(&metadata, envelope, config)
-                .map_err(|e| SdkError::InferenceError(format!("Execution failed: {}", e)))?;
+                .map_err(|e| sdk_execution_error("Execution failed", e))?;
 
             // Extract text from result (if any) and emit as single token
             if let xybrid_core::ir::EnvelopeKind::Text(text) = &result.kind {
@@ -2197,21 +2839,20 @@ impl XybridModel {
         let latency_ms = start.elapsed().as_millis() as u32;
 
         // Emit telemetry event
+        let mut data = serde_json::json!({
+            "model_id": self.model_id,
+            "version": self.version,
+            "output_type": format!("{:?}", self.output_type),
+            "streaming": true,
+        });
+        stamp_live_mode_tag(&mut data, live_tag);
         let event = crate::telemetry::TelemetryEvent {
             event_type: "ModelComplete".to_string(),
             stage_name: Some(self.model_id.clone()),
             target: Some("local".to_string()),
             latency_ms: Some(latency_ms),
             error: None,
-            data: Some(
-                serde_json::json!({
-                    "model_id": self.model_id,
-                    "version": self.version,
-                    "output_type": format!("{:?}", self.output_type),
-                    "streaming": true,
-                })
-                .to_string(),
-            ),
+            data: Some(data.to_string()),
             timestamp_ms: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as u64)
@@ -2251,10 +2892,142 @@ impl XybridModel {
         abort_state
             .check_before_run()
             .map_err(|reason| streaming_pre_run_abort_error(reason, fallback_to_cloud))?;
-        self.run_streaming(envelope, options.generation_config.as_ref(), move |token| {
-            check_abort_for_streaming(supports_streaming, &mut abort_state, fallback_to_cloud)?;
-            on_token(token)
-        })
+        let live_tag = options.live_mode_tag();
+        self.run_streaming_tagged(
+            envelope,
+            options.generation_config.as_ref(),
+            live_tag.as_ref(),
+            move |token| {
+                check_abort_for_streaming(supports_streaming, &mut abort_state, fallback_to_cloud)?;
+                on_token(token)
+            },
+        )
+    }
+
+    /// Swap `token` into the preemptive cancel-and-replace slot and cancel the
+    /// run it replaced. Returns the token that was previously in flight (if
+    /// any), already cancelled.
+    ///
+    /// **Locking contract (race-free, codex-reviewed):** holds `current_run`'s
+    /// mutex *only* for the brief swap, then releases it before issuing the
+    /// `cancel()` on the displaced token. This ordering is load-bearing:
+    /// 1. `current_run.lock()` is never held while acquiring `handle.write()`,
+    ///    so the two locks can never deadlock and a third concurrent start
+    ///    cannot wedge waiting on the swap.
+    /// 2. The displaced run is cancelled *before* the caller goes on to
+    ///    acquire `handle.write()`, so it halts at its next token boundary and
+    ///    drops the write guard promptly — the new run acquires the lock
+    ///    without waiting for the old run's natural completion (latest-frame-
+    ///    wins instead of head-of-line blocking).
+    fn preempt_register(&self, token: CancellationToken) -> Option<CancellationToken> {
+        let old = {
+            let mut slot = self.current_run.lock().unwrap_or_else(|e| e.into_inner());
+            slot.replace(token)
+        };
+        if let Some(ref old) = old {
+            old.cancel();
+        }
+        old
+    }
+
+    /// Clear the in-flight slot **iff it still holds `token`**.
+    ///
+    /// A newer preempting start may have already replaced the slot with its own
+    /// token while this run was finishing; clearing unconditionally would
+    /// clobber that newer run's registration and let a stale frame escape
+    /// cancellation. The Arc-identity check ([`CancellationToken::same_token`])
+    /// makes the clear a no-op unless the slot is still ours.
+    fn clear_current_run(&self, token: &CancellationToken) {
+        let mut slot = self.current_run.lock().unwrap_or_else(|e| e.into_inner());
+        if slot.as_ref().is_some_and(|t| t.same_token(token)) {
+            *slot = None;
+        }
+    }
+
+    /// Preemptive ("latest-frame-wins") variant of
+    /// [`Self::run_streaming_with_options`].
+    ///
+    /// When `preempt` is `true` **and** `options` carries a cancellation token,
+    /// this registers the token in the model's in-flight slot and cancels the
+    /// previously-registered run *before* acquiring the model write lock. The
+    /// displaced run halts at its next token and releases the lock, so this
+    /// call starts promptly instead of head-of-line blocking behind it. On
+    /// completion the slot is cleared if it still holds this run's token.
+    ///
+    /// When `preempt` is `false` (the default for chat and every existing
+    /// caller), this delegates straight to `run_streaming_with_options` and
+    /// never touches the slot — behavior is byte-for-byte identical to the
+    /// non-preempt path.
+    pub fn run_streaming_with_options_preempt<F>(
+        &self,
+        envelope: &Envelope,
+        options: &RunOptions,
+        preempt: bool,
+        on_token: F,
+    ) -> SdkResult<InferenceResult>
+    where
+        F: FnMut(
+                xybrid_core::runtime_adapter::types::PartialToken,
+            ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+            + Send,
+    {
+        // Only engage the slot when preemption is requested AND a token is
+        // present to register (the token is what a later preempt cancels). A
+        // preempt with no token has nothing to register, so we run plain.
+        //
+        // NOTE (known limitation): when `preempt` is true but `options` carries
+        // no cancellation token, the previous in-flight run is NOT cancelled —
+        // there is nothing to register in the slot, hence nothing for a later
+        // run to clear or cancel, and this run cannot itself be preempted.
+        // Cancel-and-replace requires a token. Callers that want latest-frame-
+        // wins must pass a fresh per-call token (the FFI/Dart streaming paths
+        // and the live-capture loop already create one per call/frame).
+        let registered = preempt
+            .then(|| options.cancellation_token.clone())
+            .flatten();
+        if let Some(ref token) = registered {
+            // Steps 1-2: swap in + cancel the displaced run before the lock.
+            self.preempt_register(token.clone());
+        }
+        let result = self.run_streaming_with_options(envelope, options, on_token);
+        if let Some(ref token) = registered {
+            // Step 4: clear the slot iff it is still ours (a newer preempt may
+            // have replaced it — don't clobber that).
+            self.clear_current_run(token);
+        }
+        result
+    }
+
+    /// Preemptive ("latest-frame-wins") variant of
+    /// [`Self::run_streaming_with_context_options`]. See
+    /// [`Self::run_streaming_with_options_preempt`] for the slot semantics and
+    /// locking contract; the only difference is the conversation context is
+    /// threaded through to the underlying run.
+    pub fn run_streaming_with_context_options_preempt<F>(
+        &self,
+        envelope: &Envelope,
+        context: &ConversationContext,
+        options: &RunOptions,
+        preempt: bool,
+        on_token: F,
+    ) -> SdkResult<InferenceResult>
+    where
+        F: FnMut(
+                xybrid_core::runtime_adapter::types::PartialToken,
+            ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+            + Send,
+    {
+        let registered = preempt
+            .then(|| options.cancellation_token.clone())
+            .flatten();
+        if let Some(ref token) = registered {
+            self.preempt_register(token.clone());
+        }
+        let result = self.run_streaming_with_context_options(envelope, context, options, on_token);
+        if let Some(ref token) = registered {
+            self.clear_current_run(token);
+        }
+        result
     }
 
     /// Run streaming inference with automatic cloud fallback on resource-driven
@@ -2295,6 +3068,9 @@ impl XybridModel {
     ///   `model`, `system_prompt`, `temperature`, …) for the retry leg. See
     ///   [`CloudRuntimeAdapter`](xybrid_core::runtime_adapter::CloudRuntimeAdapter)
     ///   for supported keys.
+    /// - Requests with `GenerationConfig::tools` do not enter the cloud leg yet:
+    ///   the gateway adapter does not forward tools, so the wrapper emits the
+    ///   local abort seam and then fails closed before policy or cloud dispatch.
     /// - The wrapper is fully synchronous; the default `CloudRuntimeAdapter`
     ///   consumes OpenAI-compatible gateway SSE via `CloudStreaming`.
     /// - **Cancellation timing across the seam.** A cancel set on the
@@ -2344,6 +3120,10 @@ impl XybridModel {
         let local_resource_summary = local_resource_guard.finish();
         let policy_metrics = fallback_policy_metrics(options);
         let signal_context = Some(SignalContext::from_metrics(&policy_metrics));
+        let tools_requested = options
+            .generation_config
+            .as_ref()
+            .is_some_and(|config| !config.tools.is_empty());
 
         dispatch_after_local(
             local_result,
@@ -2358,6 +3138,7 @@ impl XybridModel {
             policy_metrics,
             signal_context,
             options.cancellation_token.clone(),
+            tools_requested,
             on_token,
             on_seam,
         )
@@ -2376,10 +3157,15 @@ impl XybridModel {
     ///
     /// # Example
     ///
-    /// ```ignore
+    /// ```no_run
+    /// # async fn _example() {
+    /// # use xybrid_sdk::{XybridModel, StreamEvent};
+    /// # use xybrid_sdk::ir::Envelope;
+    /// # let model: XybridModel = unimplemented!();
+    /// # let envelope: Envelope = unimplemented!();
     /// use tokio_stream::StreamExt;
     ///
-    /// let mut stream = model.run_stream(envelope);
+    /// let mut stream = model.run_stream(envelope, None);
     /// while let Some(event) = stream.next().await {
     ///     match event {
     ///         StreamEvent::Token(token) => print!("{}", token.token),
@@ -2387,6 +3173,7 @@ impl XybridModel {
     ///         StreamEvent::Error(e) => eprintln!("Error: {}", e),
     ///     }
     /// }
+    /// # }
     /// ```
     pub fn run_stream(
         &self,
@@ -2461,9 +3248,7 @@ impl XybridModel {
                     let result = guard
                         .executor
                         .execute(&metadata, &envelope, config.as_ref())
-                        .map_err(|e| {
-                            SdkError::InferenceError(format!("Execution failed: {}", e))
-                        })?;
+                        .map_err(|e| sdk_execution_error("Execution failed", e))?;
 
                     // Emit single token with full result
                     if let xybrid_core::ir::EnvelopeKind::Text(text) = &result.kind {
@@ -2563,6 +3348,7 @@ impl XybridModel {
         envelope: &Envelope,
         config: Option<&GenerationConfig>,
     ) -> SdkResult<InferenceResult> {
+        crate::telemetry::maybe_emit_dev_nudge();
         let handle = self.handle.clone();
         let model_id = self.model_id.clone();
         let version = self.version.clone();
@@ -2593,7 +3379,7 @@ impl XybridModel {
             let output = guard
                 .executor
                 .execute(&metadata, &envelope, config.as_ref())
-                .map_err(|e| SdkError::InferenceError(format!("Execution failed: {}", e)))?;
+                .map_err(|e| sdk_execution_error("Execution failed", e))?;
 
             let latency_ms = start.elapsed().as_millis() as u32;
 
@@ -2622,7 +3408,7 @@ impl XybridModel {
             Ok(InferenceResult::new(output, &model_id, latency_ms))
         })
         .await
-        .map_err(|e| SdkError::InferenceError(format!("Task join error: {}", e)))?
+        .map_err(|e| SdkError::inference_src("Task join error", e))?
     }
 
     /// Create a streaming session for real-time ASR.
@@ -2635,7 +3421,11 @@ impl XybridModel {
     ///
     /// # Example
     ///
-    /// ```ignore
+    /// ```no_run
+    /// # fn _example() -> Result<(), Box<dyn std::error::Error>> {
+    /// # use xybrid_sdk::{XybridModel, StreamConfig};
+    /// # let model: XybridModel = unimplemented!();
+    /// # let audio_samples: Vec<f32> = vec![];
     /// let stream = model.stream(StreamConfig::with_vad())?;
     ///
     /// // Feed audio chunks
@@ -2648,6 +3438,8 @@ impl XybridModel {
     ///
     /// // Get final transcript
     /// let transcript = stream.flush()?;
+    /// # Ok(())
+    /// # }
     /// ```
     pub fn stream(&self, config: StreamConfig) -> SdkResult<XybridStream> {
         if !self.supports_streaming {
@@ -2700,6 +3492,9 @@ impl Clone for XybridModel {
             version: self.version.clone(),
             output_type: self.output_type,
             supports_streaming: self.supports_streaming,
+            // Share the in-flight slot so all clones coordinate preemption
+            // through one mutex (see field docs).
+            current_run: self.current_run.clone(),
         }
     }
 }
@@ -2707,6 +3502,120 @@ impl Clone for XybridModel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Serializes the tests that mutate the process-global speculative flag so
+    /// they don't observe each other's writes within the test binary.
+    static SPEC_GLOBAL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn with_speculative_cloud_records_override() {
+        let loader = ModelLoader::from_registry("m");
+        assert_eq!(loader.speculative_cloud_override(), None);
+        let loader = loader.with_speculative_cloud(true);
+        assert_eq!(loader.speculative_cloud_override(), Some(true));
+        let loader = loader.with_speculative_cloud(false);
+        assert_eq!(loader.speculative_cloud_override(), Some(false));
+    }
+
+    #[test]
+    fn per_load_override_beats_global_default() {
+        let _g = SPEC_GLOBAL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = crate::is_speculative_cloud_enabled();
+
+        // An explicit override wins regardless of the global default.
+        crate::set_speculative_cloud(false);
+        assert!(ModelLoader::from_registry("m")
+            .with_speculative_cloud(true)
+            .speculative_enabled());
+        crate::set_speculative_cloud(true);
+        assert!(!ModelLoader::from_registry("m")
+            .with_speculative_cloud(false)
+            .speculative_enabled());
+
+        crate::set_speculative_cloud(prev);
+    }
+
+    #[test]
+    fn no_override_inherits_global_default() {
+        let _g = SPEC_GLOBAL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = crate::is_speculative_cloud_enabled();
+
+        crate::set_speculative_cloud(true);
+        assert!(ModelLoader::from_registry("m").speculative_enabled());
+        crate::set_speculative_cloud(false);
+        assert!(!ModelLoader::from_registry("m").speculative_enabled());
+
+        crate::set_speculative_cloud(prev);
+    }
+
+    /// The inherent `SdkError::is_retryable` / `retry_after` accessors and
+    /// the `RetryableError` trait impl must agree for every variant — the
+    /// trait forwards to the inherent methods, so a divergence would be a
+    /// refactor slip. Covers the four retryable variants, a representative
+    /// non-retryable one, and the `RateLimited` retry-after passthrough.
+    #[test]
+    fn inherent_and_trait_retryability_agree() {
+        use xybrid_core::http::RetryableError;
+
+        let cases = [
+            (SdkError::network("x"), true),
+            (
+                SdkError::RateLimited {
+                    retry_after_secs: 5,
+                },
+                true,
+            ),
+            (SdkError::Timeout { timeout_ms: 100 }, true),
+            (SdkError::offline("x"), true),
+            (SdkError::CircuitOpen("x".into()), false),
+            (SdkError::NotLoaded, false),
+            (SdkError::ConfigError("x".into()), false),
+        ];
+        for (err, expected) in &cases {
+            assert_eq!(err.is_retryable(), *expected, "inherent for {err:?}");
+            assert_eq!(
+                RetryableError::is_retryable(err),
+                *expected,
+                "trait for {err:?}"
+            );
+        }
+
+        // Only RateLimited carries a server-specified backoff.
+        let rl = SdkError::RateLimited {
+            retry_after_secs: 7,
+        };
+        assert_eq!(rl.retry_after(), Some(std::time::Duration::from_secs(7)));
+        assert_eq!(rl.retry_after(), RetryableError::retry_after(&rl));
+        assert_eq!(SdkError::NotLoaded.retry_after(), None);
+    }
+
+    /// The wrapping variants must keep the underlying cause walkable via
+    /// `std::error::Error::source` and downcastable to its concrete type,
+    /// rather than flattening it into the message string. This is the whole
+    /// point of the `#[source]` cause: a consumer can inspect the real error
+    /// instead of string-grepping. Also asserts the message no longer
+    /// embeds the cause (no double-rendering).
+    #[test]
+    fn wrapping_variants_chain_source_cause() {
+        use std::error::Error as _;
+
+        let io = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "boom");
+        let err = SdkError::load_src("metadata unreadable", io);
+
+        // Display shows the variant prefix + context message, not the cause —
+        // the cause is reachable through `source()`, not flattened into the text.
+        assert_eq!(err.to_string(), "Failed to load model: metadata unreadable");
+
+        // The cause is preserved, walkable, and downcasts to the real type.
+        let source = err.source().expect("source cause should be present");
+        let io_cause = source
+            .downcast_ref::<std::io::Error>()
+            .expect("source should downcast to io::Error");
+        assert_eq!(io_cause.kind(), std::io::ErrorKind::PermissionDenied);
+
+        // A message-only constructor carries no source.
+        assert!(SdkError::load("no cause here").source().is_none());
+    }
 
     #[test]
     fn streaming_execution_error_preserves_typed_cloud_fallback_abort() {
@@ -2745,11 +3654,86 @@ mod tests {
             streaming_callback_error(Box::new(crate::run_options::AbortReason::UserCancelled));
 
         match error {
-            SdkError::InferenceError(message) => {
+            SdkError::InferenceError { message, source } => {
                 assert!(message.contains("Streaming callback failed"));
-                assert!(message.contains("user_cancelled"));
+                // The callback's cause is now chained as `#[source]`, not
+                // flattened into the message.
+                let cause = source.expect("callback error should chain its cause");
+                assert!(cause.to_string().contains("user_cancelled"));
             }
             other => panic!("expected inference error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn execution_error_preserves_unsupported_model_capability() {
+        let error = sdk_execution_error(
+            "Execution failed",
+            xybrid_core::error::XybridError::UnsupportedModelCapability {
+                model_id: "smollm2-360m".to_string(),
+                capability: "image input".to_string(),
+                hint: "select a VisionLanguage model".to_string(),
+            },
+        );
+
+        match error {
+            SdkError::UnsupportedModelCapability {
+                model_id,
+                capability,
+                hint,
+            } => {
+                assert_eq!(model_id, "smollm2-360m");
+                assert_eq!(capability, "image input");
+                assert!(hint.contains("VisionLanguage"));
+            }
+            other => panic!("expected unsupported model capability, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn execution_error_preserves_unsupported_backend_capability() {
+        let error = sdk_execution_error(
+            "Execution failed",
+            xybrid_core::error::XybridError::UnsupportedBackendCapability {
+                model_id: "lfm2-vl-450m".to_string(),
+                backend: "llama.cpp".to_string(),
+                capability: "vision input".to_string(),
+                hint: "rebuild with llm-llamacpp-vision".to_string(),
+            },
+        );
+
+        match error {
+            SdkError::UnsupportedBackendCapability {
+                model_id,
+                backend,
+                capability,
+                hint,
+            } => {
+                assert_eq!(model_id, "lfm2-vl-450m");
+                assert_eq!(backend, "llama.cpp");
+                assert_eq!(capability, "vision input");
+                assert!(hint.contains("llm-llamacpp-vision"));
+            }
+            other => panic!("expected unsupported backend capability, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn execution_error_preserves_missing_artifact() {
+        let error = sdk_execution_error(
+            "Execution failed",
+            xybrid_core::error::XybridError::MissingArtifact {
+                artifact: "vision_encoder".to_string(),
+                path: "/models/mmproj.gguf".to_string(),
+            },
+        );
+
+        match error {
+            SdkError::MissingArtifact { artifact, path } => {
+                assert_eq!(artifact, "vision_encoder");
+                assert_eq!(path, "/models/mmproj.gguf");
+            }
+            other => panic!("expected missing artifact, got {other:?}"),
         }
     }
 
@@ -2924,9 +3908,35 @@ mod tests {
         xybrid_core::ir::Envelope::new(xybrid_core::ir::EnvelopeKind::Text(text.to_string()))
     }
 
+    fn tool_generation_config() -> GenerationConfig {
+        let mut config = GenerationConfig::default();
+        config.tools.push(xybrid_core::gateway::Tool {
+            tool_type: "function".to_string(),
+            function: xybrid_core::gateway::FunctionDefinition {
+                name: "lookup_weather".to_string(),
+                description: Some("Look up current weather".to_string()),
+                parameters: None,
+            },
+        });
+        config
+    }
+
     fn test_loaded_model(supports_streaming: bool) -> XybridModel {
-        let metadata =
+        test_loaded_model_with_tool_calling(supports_streaming, None)
+    }
+
+    fn test_loaded_model_with_tool_calling(
+        supports_streaming: bool,
+        supports_tool_calling: Option<bool>,
+    ) -> XybridModel {
+        let mut metadata =
             xybrid_core::execution::ModelMetadata::onnx("local-test-model", "1.0", "model.onnx");
+        if let Some(supports_tool_calling) = supports_tool_calling {
+            metadata.metadata.insert(
+                "tool_calling".to_string(),
+                serde_json::Value::Bool(supports_tool_calling),
+            );
+        }
         XybridModel {
             handle: Arc::new(RwLock::new(ModelHandle {
                 executor: TemplateExecutor::default(),
@@ -2938,7 +3948,29 @@ mod tests {
             version: "1.0".to_string(),
             output_type: OutputType::Text,
             supports_streaming,
+            current_run: Arc::new(Mutex::new(None)),
         }
+    }
+
+    #[test]
+    fn supports_tool_calling_returns_true_when_declared() {
+        let model = test_loaded_model_with_tool_calling(true, Some(true));
+
+        assert_eq!(model.supports_tool_calling(), Some(true));
+    }
+
+    #[test]
+    fn supports_tool_calling_returns_false_when_declared() {
+        let model = test_loaded_model_with_tool_calling(true, Some(false));
+
+        assert_eq!(model.supports_tool_calling(), Some(false));
+    }
+
+    #[test]
+    fn supports_tool_calling_returns_none_when_absent() {
+        let model = test_loaded_model_with_tool_calling(true, None);
+
+        assert_eq!(model.supports_tool_calling(), None);
     }
 
     fn default_metrics() -> xybrid_core::context::DeviceMetrics {
@@ -3087,6 +4119,7 @@ mod tests {
             default_metrics(),
             Some(default_signal()),
             None,
+            false,
             &mut on_token,
             &mut on_seam,
         )
@@ -3145,6 +4178,62 @@ mod tests {
         assert_eq!(cloud.call_count(), 1);
         assert_eq!(result.text(), Some("hello from cloud"));
         assert_eq!(collected.lock().unwrap().as_slice(), ["hello from cloud"]);
+    }
+
+    #[test]
+    fn run_streaming_with_fallback_refuses_cloud_when_tools_requested() {
+        let model = test_loaded_model(true);
+        let cloud = FakeCloudAdapter::new("must not run");
+        let mut critical_snapshot = xybrid_core::device::ResourceSnapshot::unknown();
+        critical_snapshot.memory_pressure = xybrid_core::device::MemoryPressure::Critical;
+        let resource_provider = Arc::new(FixedUnitResourceProvider::new(critical_snapshot));
+        let options = RunOptions::new()
+            .with_generation_config(tool_generation_config())
+            .with_abort_policy(
+                crate::run_options::AbortPolicy::default()
+                    .stop_on(crate::run_options::AbortSignal::MemoryPressureCritical)
+                    .with_cloud_fallback(true)
+                    .with_max_grace_tokens(0),
+            )
+            .with_resource_provider(resource_provider)
+            .with_correlation_id("corr-tools-pre-run");
+        let envelope = text_envelope("use a tool");
+        let collected: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let collected_for_cb = collected.clone();
+        let mut on_token = move |t: xybrid_core::runtime_adapter::types::PartialToken| {
+            collected_for_cb.lock().unwrap().push(t.token);
+            Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
+        };
+        let seam_count = Arc::new(AtomicUsize::new(0));
+        let seam_count_for_cb = seam_count.clone();
+        let mut on_seam = move |s: SeamInfo| {
+            seam_count_for_cb.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            assert_eq!(s.reason, xybrid_core::abort::AbortReason::StressMemory);
+            assert_eq!(s.correlation_id, "corr-tools-pre-run");
+            assert_eq!(s.local_tokens, 0);
+        };
+
+        let result = model.run_streaming_with_fallback(
+            &envelope,
+            &options,
+            &cloud,
+            &mut on_token,
+            &mut on_seam,
+        );
+
+        match result {
+            Err(SdkError::InferenceError { message, .. }) => {
+                assert!(
+                    message.contains("cloud fallback is not available for tool-calling requests"),
+                    "{message}"
+                );
+                assert!(message.contains("tools are not forwarded"), "{message}");
+            }
+            other => panic!("expected unsupported tools fallback error, got {other:?}"),
+        }
+        assert_eq!(seam_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(cloud.call_count(), 0);
+        assert!(collected.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -3217,6 +4306,7 @@ mod tests {
             default_metrics(),
             Some(default_signal()),
             None,
+            false,
             &mut on_token,
             &mut on_seam,
         )
@@ -3243,6 +4333,75 @@ mod tests {
         assert!(matches!(
             outcomes[1].target,
             xybrid_core::orchestrator::authority::ResolvedTarget::Cloud { .. }
+        ));
+        assert_eq!(outcomes[1].model_id.as_deref(), Some("deepseek-chat"));
+    }
+
+    #[test]
+    fn dispatch_after_local_records_cloud_hard_fail_when_tools_requested() {
+        let cloud = FakeCloudAdapter::new("must not run");
+        let authority = FakeAuthority::allow();
+        let mut envelope = text_envelope("use a tool");
+        envelope
+            .metadata
+            .insert("provider".to_string(), "deepseek".to_string());
+        envelope
+            .metadata
+            .insert("model".to_string(), "deepseek-chat".to_string());
+        let mut on_token =
+            |_: xybrid_core::runtime_adapter::types::PartialToken| -> Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) };
+        let seam_count = Arc::new(AtomicUsize::new(0));
+        let seam_count_for_cb = seam_count.clone();
+        let mut on_seam = move |_s: SeamInfo| {
+            seam_count_for_cb.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        };
+        let local_result: SdkResult<InferenceResult> = Err(SdkError::AbortedForCloudFallback {
+            reason: xybrid_core::abort::AbortReason::StressMemory,
+        });
+
+        let result = dispatch_after_local(
+            local_result,
+            &envelope,
+            &cloud,
+            "corr-tools".to_string(),
+            "local-model",
+            2,
+            120,
+            None,
+            &authority,
+            default_metrics(),
+            Some(default_signal()),
+            None,
+            true,
+            &mut on_token,
+            &mut on_seam,
+        );
+
+        match result {
+            Err(SdkError::InferenceError { message, .. }) => {
+                assert!(
+                    message.contains("cloud fallback is not available for tool-calling requests"),
+                    "{message}"
+                );
+            }
+            other => panic!("expected unsupported tools fallback error, got {other:?}"),
+        }
+        assert_eq!(seam_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(cloud.call_count(), 0);
+        assert!(authority.policy_requests().is_empty());
+
+        let outcomes = authority.outcomes();
+        assert_eq!(outcomes.len(), 2);
+        assert!(matches!(
+            outcomes[0].category,
+            Some(
+                xybrid_core::orchestrator::authority::OutcomeCategory::AbortedForCloudFallback { .. }
+            )
+        ));
+        assert!(matches!(
+            outcomes[1].category,
+            Some(xybrid_core::orchestrator::authority::OutcomeCategory::HardFail { ref reason })
+                if reason == CLOUD_FALLBACK_UNSUPPORTED_TOOLS_REASON
         ));
         assert_eq!(outcomes[1].model_id.as_deref(), Some("deepseek-chat"));
     }
@@ -3278,13 +4437,17 @@ mod tests {
             default_metrics(),
             Some(default_signal()),
             None,
+            false,
             &mut on_token,
             &mut on_seam,
         );
 
         match result {
-            Err(SdkError::InferenceError(message)) => {
-                assert!(message.contains("gateway unavailable"), "{message}");
+            Err(SdkError::InferenceError { message, source }) => {
+                // The underlying cause is chained as `#[source]`; reconstruct
+                // the full chain to assert on the original failure text.
+                let full = source.map_or(message.clone(), |s| format!("{message}: {s}"));
+                assert!(full.contains("gateway unavailable"), "{full}");
             }
             other => panic!("expected cloud retry failure, got {other:?}"),
         }
@@ -3344,6 +4507,7 @@ mod tests {
             default_metrics(),
             Some(default_signal()),
             None,
+            false,
             &mut on_token,
             &mut on_seam,
         )
@@ -3392,17 +4556,642 @@ mod tests {
             default_metrics(),
             Some(default_signal()),
             Some(cancellation),
+            false,
             &mut on_token,
             &mut on_seam,
         );
 
         match result {
-            Err(SdkError::InferenceError(message)) => assert!(message.contains("user_cancelled")),
+            Err(SdkError::InferenceError { message, .. }) => {
+                assert!(message.contains("user_cancelled"))
+            }
             other => panic!("expected user_cancelled error, got {other:?}"),
         }
         assert_eq!(seam_count.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert_eq!(cloud.call_count(), 0);
         assert_eq!(authority.outcomes().len(), 1);
+    }
+
+    /// Short-circuit case (FFI issue 10): a token cancelled *before* the run
+    /// starts must abort in the pre-run gate (`check_before_run`) with
+    /// `UserCancelled`, before the model write lock is ever taken — and the
+    /// lock must be free afterwards.
+    ///
+    /// This intentionally does NOT prove the held-then-released path (the lock
+    /// is never acquired here because the pre-run gate fires first). The
+    /// mid-stream held-lock release is covered by
+    /// `run_streaming_with_options_mid_stream_cancel_releases_held_write_lock`.
+    #[test]
+    fn run_streaming_with_options_pre_run_cancellation_short_circuits_before_lock() {
+        let model = test_loaded_model(true);
+        let token = CancellationToken::new();
+        let options = RunOptions::new()
+            .with_cancellation_token(token.clone())
+            .with_abort_policy(
+                crate::run_options::AbortPolicy::default()
+                    .stop_on(crate::run_options::AbortSignal::UserCancelled),
+            );
+        let envelope = text_envelope("tell me a long story");
+
+        // Cancel before the run so the pre-run gate aborts deterministically
+        // without needing a real token stream.
+        token.cancel();
+
+        let started = Instant::now();
+        let err = model
+            .run_streaming_with_options(&envelope, &options, |_token| Ok(()))
+            .expect_err("cancelled run must abort, not produce a result");
+        let elapsed = started.elapsed();
+
+        // (a) The run halts with a user-cancellation error (terminal; never a
+        // cloud-fallback marker).
+        match err {
+            SdkError::InferenceError {
+                ref message,
+                ref source,
+                ..
+            } => {
+                let full = match source {
+                    Some(s) => format!("{message}: {s}"),
+                    None => message.clone(),
+                };
+                assert!(
+                    full.contains("user_cancelled"),
+                    "expected user_cancelled abort, got: {full}"
+                );
+            }
+            other => panic!("expected user_cancelled InferenceError, got {other:?}"),
+        }
+
+        // (b) The model write lock must be free immediately after the aborted
+        // run returns — `try_write` succeeding proves the run did not leave the
+        // lock held. (acquirable well within one token).
+        assert!(
+            model.handle.try_write().is_ok(),
+            "model write lock must be released after a cancelled streaming run"
+        );
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "cancelled run should return promptly, took {elapsed:?}"
+        );
+    }
+
+    /// Fake `"onnx"` runtime that blocks inside `execute()` until released, so a
+    /// test can observe the model write lock being *held* mid-run. On release it
+    /// returns a text envelope, after which the streaming path emits a single
+    /// synthetic token through the per-token abort gate — exactly the boundary
+    /// that halts a real LLM stream when the token is cancelled.
+    struct BlockingFakeRuntime {
+        entered_tx: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+        release_rx: Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl xybrid_core::runtime_adapter::ModelRuntime for BlockingFakeRuntime {
+        fn name(&self) -> &str {
+            "onnx"
+        }
+
+        fn supported_formats(&self) -> Vec<&str> {
+            vec!["onnx"]
+        }
+
+        fn load(
+            &mut self,
+            _model_path: &std::path::Path,
+        ) -> xybrid_core::runtime_adapter::AdapterResult<()> {
+            Ok(())
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn execute(
+            &mut self,
+            _input: &xybrid_core::ir::Envelope,
+        ) -> xybrid_core::runtime_adapter::AdapterResult<xybrid_core::ir::Envelope> {
+            // Signal that we are inside execute() — the write lock is held now.
+            if let Some(tx) = self.entered_tx.lock().unwrap().take() {
+                let _ = tx.send(());
+            }
+            // Block until the test releases us (after it has cancelled the
+            // token and confirmed the lock is held).
+            let _ = self.release_rx.lock().unwrap().recv();
+            Ok(xybrid_core::ir::Envelope::new(
+                xybrid_core::ir::EnvelopeKind::Text("partial output".to_string()),
+            ))
+        }
+    }
+
+    fn test_model_with_runtime(
+        runtime: Box<dyn xybrid_core::runtime_adapter::ModelRuntime>,
+    ) -> XybridModel {
+        let metadata =
+            xybrid_core::execution::ModelMetadata::onnx("local-test-model", "1.0", "model.onnx");
+        let mut executor = TemplateExecutor::default();
+        // Register under "onnx" so the bare-Onnx execute path uses our fake.
+        executor.register_runtime("onnx", runtime);
+        XybridModel {
+            handle: Arc::new(RwLock::new(ModelHandle {
+                executor,
+                metadata,
+                model_dir: PathBuf::from("."),
+                loaded: true,
+            })),
+            model_id: "local-test-model".to_string(),
+            version: "1.0".to_string(),
+            output_type: OutputType::Text,
+            supports_streaming: true,
+            current_run: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Acceptance for the reachable-cancellation path (FFI issue 10),
+    /// held-then-released case: a cancel issued *during* generation (while the
+    /// model write lock is HELD) must (a) halt the run with `UserCancelled`
+    /// rather than completing naturally, and (b) release the held write lock so
+    /// a follow-up run can acquire it.
+    ///
+    /// Unlike the pre-run short-circuit test, this drives a fake runtime that
+    /// blocks inside `execute()` — so the test can assert `try_write()` FAILS
+    /// while the run is mid-flight (lock genuinely held), then cancel, then
+    /// assert `try_write()` succeeds after the run unwinds.
+    #[test]
+    fn run_streaming_with_options_mid_stream_cancel_releases_held_write_lock() {
+        use std::sync::mpsc;
+
+        let (entered_tx, entered_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let runtime = BlockingFakeRuntime {
+            entered_tx: Mutex::new(Some(entered_tx)),
+            release_rx: Mutex::new(release_rx),
+        };
+        let model = test_model_with_runtime(Box::new(runtime));
+
+        let token = CancellationToken::new();
+        let options = RunOptions::new()
+            .with_cancellation_token(token.clone())
+            .with_abort_policy(
+                crate::run_options::AbortPolicy::default()
+                    .stop_on(crate::run_options::AbortSignal::UserCancelled),
+            );
+
+        // Run the streaming call on a worker thread so we can inspect lock state
+        // from the test thread while the run is mid-flight.
+        let model_for_worker = model.clone();
+        let worker = std::thread::spawn(move || {
+            let envelope = text_envelope("tell me a long story");
+            model_for_worker.run_streaming_with_options(&envelope, &options, |_token| Ok(()))
+        });
+
+        // Wait until the runtime is inside execute() — the write lock is now held.
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("runtime should enter execute() and hold the write lock");
+
+        // Prove the lock is genuinely HELD mid-run: a write acquisition must fail.
+        assert!(
+            model.handle.try_write().is_err(),
+            "write lock must be held while the streaming run is mid-flight"
+        );
+
+        // Cancel mid-generation, then let execute() return so the per-token
+        // abort gate observes the cancellation at the (single) token boundary.
+        token.cancel();
+        release_tx.send(()).expect("release the blocked runtime");
+
+        let result = worker.join().expect("streaming worker should not panic");
+
+        // (a) The run halted on user cancellation rather than completing
+        // naturally with the runtime's "partial output".
+        match result {
+            Err(SdkError::InferenceError {
+                ref message,
+                ref source,
+                ..
+            }) => {
+                let full = match source {
+                    Some(s) => format!("{message}: {s}"),
+                    None => message.clone(),
+                };
+                assert!(
+                    full.contains("user_cancelled"),
+                    "expected user_cancelled abort, got: {full}"
+                );
+            }
+            Ok(r) => panic!(
+                "mid-stream cancel must abort, but run completed naturally: {:?}",
+                r.text()
+            ),
+            Err(other) => panic!("expected user_cancelled InferenceError, got {other:?}"),
+        }
+
+        // (b) The previously-HELD write lock must now be released — bounded wait
+        // to allow the worker's lock guard to drop on its own thread.
+        let mut acquired = false;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            if model.handle.try_write().is_ok() {
+                acquired = true;
+                break;
+            }
+            std::thread::yield_now();
+        }
+        assert!(
+            acquired,
+            "the HELD model write lock must be released after a mid-stream cancellation"
+        );
+    }
+
+    /// Fake `"onnx"` runtime for the preemptive cancel-and-replace tests. Each
+    /// `execute()` call increments `runtime_entered` (proving a run actually
+    /// entered the runtime *while holding the model write lock*), signals entry
+    /// (so the test sees the write lock held), and blocks until the test
+    /// releases *that* call. Unlike `BlockingFakeRuntime` (one-shot entry
+    /// signal), this supports the N sequential `execute()` calls that the
+    /// preempt + stress tests drive against the single shared model write lock.
+    struct MultiBlockingFakeRuntime {
+        /// Count of `execute()` calls that reached the runtime while holding the
+        /// write lock. Lets the stress test assert preemption happened under
+        /// *real* lock contention (a replacement acquired the freed lock and
+        /// ran), not vacuously via everyone aborting at the pre-run gate.
+        runtime_entered: Arc<AtomicUsize>,
+        entered_tx: Mutex<std::sync::mpsc::Sender<()>>,
+        release_rx: Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl xybrid_core::runtime_adapter::ModelRuntime for MultiBlockingFakeRuntime {
+        fn name(&self) -> &str {
+            "onnx"
+        }
+
+        fn supported_formats(&self) -> Vec<&str> {
+            vec!["onnx"]
+        }
+
+        fn load(
+            &mut self,
+            _model_path: &std::path::Path,
+        ) -> xybrid_core::runtime_adapter::AdapterResult<()> {
+            Ok(())
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn execute(
+            &mut self,
+            _input: &xybrid_core::ir::Envelope,
+        ) -> xybrid_core::runtime_adapter::AdapterResult<xybrid_core::ir::Envelope> {
+            // We are inside the runtime holding the write lock — record it.
+            self.runtime_entered
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            // Signal entry: the write lock is held for this call now.
+            let _ = self.entered_tx.lock().unwrap().send(());
+            // Block until the test releases this specific call.
+            let _ = self.release_rx.lock().unwrap().recv();
+            Ok(xybrid_core::ir::Envelope::new(
+                xybrid_core::ir::EnvelopeKind::Text("partial output".to_string()),
+            ))
+        }
+    }
+
+    fn preempt_options(token: &CancellationToken) -> RunOptions {
+        RunOptions::new()
+            .with_cancellation_token(token.clone())
+            .with_abort_policy(
+                crate::run_options::AbortPolicy::default()
+                    .stop_on(crate::run_options::AbortSignal::UserCancelled),
+            )
+    }
+
+    /// Issue 11 acceptance — **preempt frees the lock without waiting for A's
+    /// natural completion**. Run A blocks inside the fake runtime holding the
+    /// write lock. Run B starts WITH preempt + a registered token; B's preempt
+    /// cancels A *before* B tries to acquire the lock. We then let A's
+    /// `execute()` return so A observes the cancel at its (single) token gate,
+    /// returns `user_cancelled`, and drops the write guard — at which point B
+    /// acquires the lock and completes. The key assertion is that A halts on
+    /// cancellation (latest-frame-wins) and the lock becomes acquirable for B
+    /// promptly, rather than B head-of-line blocking behind A.
+    #[test]
+    fn preempt_cancels_in_flight_run_and_frees_lock_for_replacement() {
+        use std::sync::mpsc;
+
+        let (entered_tx, entered_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let runtime = MultiBlockingFakeRuntime {
+            runtime_entered: Arc::new(AtomicUsize::new(0)),
+            entered_tx: Mutex::new(entered_tx),
+            release_rx: Mutex::new(release_rx),
+        };
+        let model = test_model_with_runtime(Box::new(runtime));
+
+        // Run A: a normal streaming run that blocks inside execute() holding
+        // the write lock. It carries its own token registered in the slot so
+        // B's preempt has something to cancel.
+        let token_a = CancellationToken::new();
+        let options_a = preempt_options(&token_a);
+        let model_a = model.clone();
+        let worker_a = std::thread::spawn(move || {
+            let envelope = text_envelope("frame A");
+            model_a.run_streaming_with_options_preempt(
+                &envelope,
+                &options_a,
+                /* preempt */ true,
+                |_token| Ok(()),
+            )
+        });
+
+        // Wait until A is inside execute() — the write lock is held.
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("run A should enter execute() and hold the write lock");
+        assert!(
+            model.handle.try_write().is_err(),
+            "run A must hold the write lock while mid-flight"
+        );
+
+        // Run B: preempting start. preempt_register cancels A's token BEFORE B
+        // touches the write lock. B will then block on handle.write() until A
+        // releases it.
+        let token_b = CancellationToken::new();
+        let options_b = preempt_options(&token_b);
+        let model_b = model.clone();
+        let (b_done_tx, b_done_rx) = mpsc::channel::<()>();
+        let worker_b = std::thread::spawn(move || {
+            let envelope = text_envelope("frame B");
+            let r = model_b.run_streaming_with_options_preempt(
+                &envelope,
+                &options_b,
+                /* preempt */ true,
+                |_token| Ok(()),
+            );
+            let _ = b_done_tx.send(());
+            r
+        });
+
+        // B's preempt must flip A's token even though A still holds the lock.
+        let cancel_deadline = Instant::now() + Duration::from_secs(2);
+        while !token_a.is_cancelled() && Instant::now() < cancel_deadline {
+            std::thread::yield_now();
+        }
+        assert!(
+            token_a.is_cancelled(),
+            "B's preempt must cancel A's in-flight token before acquiring the write lock"
+        );
+
+        // B must NOT have finished yet — it is blocked on handle.write() behind
+        // A, which still holds the lock. This proves preemption did not somehow
+        // bypass the lock.
+        assert!(
+            b_done_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "B must still be waiting on the write lock while A holds it"
+        );
+
+        // Release A's execute() so A reaches its token gate, sees the cancel,
+        // and unwinds — freeing the lock. Then release B's execute() so B can
+        // complete once it acquires the lock.
+        release_tx.send(()).expect("release A");
+        release_tx.send(()).expect("release B");
+
+        let result_a = worker_a.join().expect("run A worker should not panic");
+        let result_b = worker_b.join().expect("run B worker should not panic");
+
+        // A halted on user cancellation (its partial output was discarded),
+        // proving latest-frame-wins rather than A completing naturally.
+        match result_a {
+            Err(SdkError::InferenceError {
+                ref message,
+                ref source,
+                ..
+            }) => {
+                let full = match source {
+                    Some(s) => format!("{message}: {s}"),
+                    None => message.clone(),
+                };
+                assert!(
+                    full.contains("user_cancelled"),
+                    "run A must abort on preempt, got: {full}"
+                );
+            }
+            Ok(r) => panic!(
+                "preempted run A must abort, but completed naturally: {:?}",
+                r.text()
+            ),
+            Err(other) => panic!("expected user_cancelled for A, got {other:?}"),
+        }
+
+        // B was not preempted by anyone, so it completes normally.
+        assert!(
+            result_b.is_ok(),
+            "replacement run B should complete, got {result_b:?}"
+        );
+
+        // Slot ends holding B's token (B cleared only if still its own; nothing
+        // displaced B, so B's clear-if-ours emptied it).
+        let slot = model.current_run.lock().unwrap();
+        assert!(
+            slot.is_none(),
+            "after the last run clears its own token, the slot must be empty"
+        );
+    }
+
+    /// Issue 11 mutation-check companion: the `preempt_cancels_…` assertion
+    /// that A aborts is load-bearing. This test documents what happens when
+    /// preemption is NOT requested — A runs to natural completion even though B
+    /// starts — so the contrast confirms the preempt path is what cancels A.
+    /// (Temporarily breaking `preempt_register` to a no-op makes
+    /// `preempt_cancels_in_flight_run_and_frees_lock_for_replacement` fail at
+    /// the `token_a.is_cancelled()` assertion — verified during development.)
+    #[test]
+    fn without_preempt_in_flight_run_is_not_cancelled_by_a_later_start() {
+        use std::sync::mpsc;
+
+        let (entered_tx, entered_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let runtime = MultiBlockingFakeRuntime {
+            runtime_entered: Arc::new(AtomicUsize::new(0)),
+            entered_tx: Mutex::new(entered_tx),
+            release_rx: Mutex::new(release_rx),
+        };
+        let model = test_model_with_runtime(Box::new(runtime));
+
+        let token_a = CancellationToken::new();
+        let options_a = preempt_options(&token_a);
+        let model_a = model.clone();
+        let worker_a = std::thread::spawn(move || {
+            let envelope = text_envelope("frame A");
+            // preempt = false: A registers nothing in the slot.
+            model_a.run_streaming_with_options_preempt(
+                &envelope,
+                &options_a,
+                /* preempt */ false,
+                |_token| Ok(()),
+            )
+        });
+
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("run A should enter execute()");
+
+        // A non-preempting "later start" cannot cancel A: with preempt=false the
+        // slot is never touched. Release A so it completes naturally.
+        release_tx.send(()).expect("release A");
+        let result_a = worker_a.join().expect("run A worker should not panic");
+
+        assert!(
+            !token_a.is_cancelled(),
+            "without preempt, A's token must never be cancelled by the slot"
+        );
+        assert!(
+            result_a.is_ok(),
+            "non-preempt run A should complete naturally, got {result_a:?}"
+        );
+        // The slot was never engaged.
+        assert!(
+            model.current_run.lock().unwrap().is_none(),
+            "non-preempt runs must not register in the in-flight slot"
+        );
+    }
+
+    /// Issue 11 stress / no-deadlock: rapidly cycle start-replace N times
+    /// against the fake runtime. Each cycle starts a preempting run that
+    /// cancels its predecessor, then is itself released. Asserts the whole
+    /// cycle completes within a bounded time (no deadlock), no panic, and the
+    /// slot ends consistent (the last run's token, then None after it clears).
+    #[test]
+    fn rapid_preempt_cycling_does_not_deadlock_and_leaves_consistent_slot() {
+        use std::sync::mpsc;
+
+        const N: usize = 20;
+
+        let (entered_tx, entered_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let runtime_entered = Arc::new(AtomicUsize::new(0));
+        let runtime = MultiBlockingFakeRuntime {
+            runtime_entered: runtime_entered.clone(),
+            entered_tx: Mutex::new(entered_tx),
+            release_rx: Mutex::new(release_rx),
+        };
+        let model = test_model_with_runtime(Box::new(runtime));
+
+        let started = Instant::now();
+
+        // Deterministic cycle to force preemption under *real* lock contention
+        // (not a vacuous pass where every run aborts at the pre-run gate before
+        // ever acquiring the write lock):
+        //
+        //   1. Start run i (preempt=true) on a worker thread.
+        //   2. Wait until run i has actually ENTERED the runtime — at which
+        //      point it holds the model write lock and blocks inside execute().
+        //   3. Start run i+1 (preempt=true). Its preempt_register cancels run
+        //      i's token BEFORE run i+1 tries handle.write(), so run i+1 then
+        //      blocks on the write lock that run i still holds.
+        //   4. Release run i's execute() block. Run i hits its token gate, sees
+        //      the cancel, returns user_cancelled, and DROPS the write guard —
+        //      freeing the lock so run i+1 acquires it and enters the runtime.
+        //
+        // Each replacement therefore observably acquires a lock freed by the
+        // preemption it triggered. If the preempt cancel were neutered, run i
+        // would never be cancelled, run i+1 would block forever on
+        // handle.write(), and step 2 for run i+1 (`entered_rx.recv_timeout`)
+        // would time out — the test fails/hangs-then-fails rather than passing.
+        let mut workers = Vec::with_capacity(N);
+        let mut prev: Option<CancellationToken> = None;
+        for i in 0..N {
+            let token = CancellationToken::new();
+            let options = preempt_options(&token);
+            let model_i = model.clone();
+            workers.push(std::thread::spawn(move || {
+                let envelope = text_envelope(&format!("frame {i}"));
+                model_i.run_streaming_with_options_preempt(
+                    &envelope,
+                    &options,
+                    /* preempt */ true,
+                    |_token| Ok(()),
+                )
+            }));
+
+            // Wait for THIS run to enter the runtime (holding the write lock).
+            // Its own preempt already cancelled the previous run's token; now we
+            // release the previous run so it unwinds and frees the lock for this
+            // one to acquire and enter.
+            if let Some(prev_token) = prev.take() {
+                // The new run's preempt must have flipped the previous token.
+                let cancel_deadline = Instant::now() + Duration::from_secs(5);
+                while !prev_token.is_cancelled() && Instant::now() < cancel_deadline {
+                    std::thread::yield_now();
+                }
+                assert!(
+                    prev_token.is_cancelled(),
+                    "run {i}'s preempt must cancel the previous in-flight run's token"
+                );
+                // Release the previous run's execute() so it unwinds and frees
+                // the lock for run i.
+                release_tx.send(()).expect("release previous run");
+            }
+            entered_rx
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "run {i} must enter the runtime under contention — a timeout here means \
+                         the previous run's lock was never freed (preempt cancel broken / deadlock)"
+                    )
+                });
+            prev = Some(token);
+        }
+
+        // Release the final still-blocked run so it completes naturally.
+        release_tx.send(()).expect("release final run");
+
+        let mut panics = 0;
+        for worker in workers {
+            if worker.join().is_err() {
+                panics += 1;
+            }
+        }
+        let elapsed = started.elapsed();
+
+        assert_eq!(panics, 0, "no preempt worker should panic");
+        // A true deadlock would block a worker join (or the per-cycle
+        // recv_timeout) indefinitely and blow well past this bound.
+        assert!(
+            elapsed < Duration::from_secs(30),
+            "rapid preempt cycling must not deadlock; took {elapsed:?}"
+        );
+
+        // LOAD-BEARING: every run actually entered the runtime while holding the
+        // write lock, so all N preemptions happened under genuine lock
+        // contention (a replacement acquired a lock freed by the preemption it
+        // triggered). This is the assertion that fails if preemption regresses
+        // to head-of-line blocking or the test passes vacuously.
+        let entered = runtime_entered.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            entered, N,
+            "all {N} runs must enter the runtime under real lock contention; only {entered} did \
+             (a vacuous pass / broken preemption would leave this short of {N})"
+        );
+
+        // Slot is in a consistent terminal state: the mutex is not poisoned
+        // (the `.expect` proves it). The final run cleared its own token, so the
+        // slot is empty.
+        let slot = model
+            .current_run
+            .lock()
+            .expect("slot mutex must not be poisoned after rapid cycling");
+        assert!(
+            slot.is_none(),
+            "after the final run clears its own token, the slot must be empty"
+        );
+        drop(slot);
+
+        // And the model write lock must be free — no run left a guard held.
+        assert!(
+            model.handle.try_write().is_ok(),
+            "model write lock must be free after rapid preempt cycling (no held guard)"
+        );
     }
 
     #[test]
@@ -3433,12 +5222,13 @@ mod tests {
             default_metrics(),
             Some(default_signal()),
             None,
+            false,
             &mut on_token,
             &mut on_seam,
         );
 
         match result {
-            Err(SdkError::InferenceError(message)) => {
+            Err(SdkError::InferenceError { message, .. }) => {
                 assert!(message.contains("cloud_denied_by_policy"));
             }
             other => panic!("expected cloud_denied_by_policy error, got {other:?}"),
@@ -3491,6 +5281,7 @@ mod tests {
             default_metrics(),
             Some(default_signal()),
             None,
+            false,
             &mut on_token,
             &mut on_seam,
         )
@@ -3528,6 +5319,7 @@ mod tests {
             default_metrics(),
             Some(default_signal()),
             None,
+            false,
             &mut on_token,
             &mut on_seam,
         )
@@ -3565,6 +5357,7 @@ mod tests {
             default_metrics(),
             Some(default_signal()),
             None,
+            false,
             &mut on_token,
             &mut on_seam,
         )
@@ -3589,8 +5382,7 @@ mod tests {
             seam_fired_for_cb.store(true, std::sync::atomic::Ordering::SeqCst);
         };
 
-        let local_result: SdkResult<InferenceResult> =
-            Err(SdkError::InferenceError("local failed".to_string()));
+        let local_result: SdkResult<InferenceResult> = Err(SdkError::inference("local failed"));
 
         let result = dispatch_after_local(
             local_result,
@@ -3605,12 +5397,15 @@ mod tests {
             default_metrics(),
             Some(default_signal()),
             None,
+            false,
             &mut on_token,
             &mut on_seam,
         );
 
         match result {
-            Err(SdkError::InferenceError(msg)) => assert!(msg.contains("local failed")),
+            Err(SdkError::InferenceError { message: msg, .. }) => {
+                assert!(msg.contains("local failed"))
+            }
             other => panic!("expected InferenceError, got {:?}", other),
         }
         assert!(!seam_fired.load(std::sync::atomic::Ordering::SeqCst));
@@ -3648,12 +5443,16 @@ mod tests {
             default_metrics(),
             Some(default_signal()),
             None,
+            false,
             &mut on_token,
             &mut on_seam,
         );
 
         match result {
-            Err(SdkError::InferenceError(message)) => assert!(message.contains("user_cancelled")),
+            Err(SdkError::InferenceError { message, source }) => {
+                let full = source.map_or(message.clone(), |s| format!("{message}: {s}"));
+                assert!(full.contains("user_cancelled"), "{full}");
+            }
             other => panic!("expected terminal user_cancelled error, got {other:?}"),
         }
         assert!(!seam_fired.load(std::sync::atomic::Ordering::SeqCst));

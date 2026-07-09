@@ -5,14 +5,14 @@ description: Get up and running with Xybrid in minutes
 
 Get Xybrid running in your app with a few lines of code. Choose your SDK below.
 
-<Tabs items={['Flutter', 'Swift', 'Kotlin', 'Unity', 'CLI']}>
+<Tabs items={['Flutter', 'Swift', 'Kotlin', 'Unity', 'Rust', 'CLI']}>
   <Tab value="Flutter">
 **Install**
 
 ```yaml
 # pubspec.yaml
 dependencies:
-  xybrid_flutter: ^0.1.0-beta5
+  xybrid_flutter: ^0.3.0
 ```
 
 ```bash
@@ -24,6 +24,8 @@ flutter pub get
 ```dart
 import 'package:xybrid_flutter/xybrid_flutter.dart';
 
+// Runs locally as-is. Add a free key from dashboard.xybrid.dev to see
+// your inference traces: Xybrid.init(apiKey: '...')
 await Xybrid.init();
 
 // Load a model and run text-to-speech
@@ -52,18 +54,18 @@ Or add to `Package.swift`:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/xybrid-ai/xybrid", exact: "0.1.0-beta13")
+    .package(url: "https://github.com/xybrid-ai/xybrid", from: "0.3.0")
 ]
 ```
-
-> Use `exact:` while pinning a beta tag — SPM's `from:` excludes pre-release
-> identifiers per SemVer. Switch to `from: "0.1.0"` once a stable `0.1.0`
-> ships.
 
 **Run inference**
 
 ```swift
 import Xybrid
+
+// Runs locally as-is. Add a free key from dashboard.xybrid.dev to see
+// your inference traces: Xybrid.initialize(apiKey: "...")
+Xybrid.initialize()
 
 // Load a model from the registry
 let loader = ModelLoader.fromRegistry(modelId: "kokoro-82m")
@@ -84,7 +86,7 @@ let result = try model.run(envelope: envelope)
 ```kotlin
 // build.gradle.kts
 dependencies {
-    implementation("ai.xybrid:xybrid-kotlin:0.1.0-beta5")
+    implementation("ai.xybrid:xybrid-kotlin:0.3.0")
 }
 ```
 
@@ -92,6 +94,10 @@ dependencies {
 
 ```kotlin
 import ai.xybrid.*
+
+// Runs locally as-is. Add a free key from dashboard.xybrid.dev to see
+// your inference traces: Xybrid.init(context, apiKey = "...")
+Xybrid.init(context)
 
 // Load a model from the registry
 val loader = XybridModelLoader.fromRegistry("kokoro-82m")
@@ -112,14 +118,10 @@ val result = model.run(envelope)
 In Unity, go to **Window > Package Manager > + > Add package from git URL** and enter:
 
 ```
-https://github.com/xybrid-ai/xybrid.git#upm
+https://github.com/xybrid-ai/xybrid.git?path=/bindings/unity
 ```
 
-Or pin a specific version:
-
-```
-https://github.com/xybrid-ai/xybrid.git#upm/v0.1.0-beta5
-```
+Or via [OpenUPM](https://openupm.com/packages/ai.xybrid.sdk/): `openupm add ai.xybrid.sdk`. Native libraries download automatically on first import (SHA-256 verified); pin a version by appending `#v0.3.0` to the git URL.
 
 **Run inference**
 
@@ -127,7 +129,8 @@ https://github.com/xybrid-ai/xybrid.git#upm/v0.1.0-beta5
 using Xybrid;
 using UnityEngine;
 
-// Initialize the SDK
+// Runs locally as-is. Add a free key from dashboard.xybrid.dev to see
+// your inference traces: XybridClient.Initialize(apiKey: "...")
 XybridClient.Initialize();
 
 // Load a TTS model and generate NPC dialogue
@@ -141,12 +144,52 @@ Debug.Log($"Latency: {result.LatencyMs}ms");
 
 **Expected output:** `result.Success == true` with audio output from the TTS model.
   </Tab>
+  <Tab value="Rust">
+**Install**
+
+```toml
+# Cargo.toml
+[dependencies]
+xybrid = "0.3.0"
+```
+
+**Run inference**
+
+```rust
+use xybrid::ModelLoader;
+use xybrid::ir::{Envelope, EnvelopeKind};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Load a model from the registry
+    let model = ModelLoader::from_registry("kokoro-82m").load()?;
+
+    // Run text-to-speech
+    let input = Envelope::new(EnvelopeKind::Text("Hello from Xybrid!".into()));
+    let result = model.run(&input, None)?;
+
+    // result contains the generated speech audio
+    Ok(())
+}
+```
+
+LLM models need the llama.cpp backend — enable it with `features = ["llm-llamacpp"]`.
+
+**Expected output:** A result envelope containing synthesized speech audio.
+  </Tab>
   <Tab value="CLI">
 **Install**
 
 ```bash
-cargo install xybrid-cli
+# macOS / Linux
+curl -sSL https://raw.githubusercontent.com/xybrid-ai/xybrid/master/install.sh | sh
 ```
+
+```powershell
+# Windows (PowerShell)
+irm https://raw.githubusercontent.com/xybrid-ai/xybrid/master/install.ps1 | iex
+```
+
+See the [CLI guide](/docs/cli) for pre-built binaries and building from source.
 
 **Run inference**
 
@@ -172,7 +215,8 @@ Transcription: "Hello, how can I help you?"
 ## Next Steps
 
 <Cards>
-  <Card title="SDKs" href="/docs/integrations/sdks" description="Detailed SDK guides for each platform" />
-  <Card title="Pipelines" href="/docs/concepts/pipelines" description="Chain multiple models together" />
-  <Card title="Concepts" href="/docs/concepts" description="How Xybrid works under the hood" />
+  <Card title="SDKs" href="/docs/sdks/flutter" description="Detailed SDK guides for each platform" />
+  <Card title="Models" href="/docs/concepts/models" description="Browse the on-device model catalog" />
+  <Card title="Pipelines" href="/docs/concepts/pipelines" description="Chain models with a few lines of YAML" />
+  <Card title="CLI" href="/docs/cli" description="Run and debug models from the terminal" />
 </Cards>

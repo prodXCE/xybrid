@@ -25,6 +25,7 @@ class FfiInferenceMetrics {
   final double? prefillTps;
   final double? decodeTps;
   final int? tokensOut;
+  final int? imagePreprocessMs;
   final List<FfiStageLatency> stageLatenciesMs;
 
   const FfiInferenceMetrics({
@@ -34,6 +35,7 @@ class FfiInferenceMetrics {
     this.prefillTps,
     this.decodeTps,
     this.tokensOut,
+    this.imagePreprocessMs,
     required this.stageLatenciesMs,
   });
 
@@ -45,6 +47,7 @@ class FfiInferenceMetrics {
       prefillTps.hashCode ^
       decodeTps.hashCode ^
       tokensOut.hashCode ^
+      imagePreprocessMs.hashCode ^
       stageLatenciesMs.hashCode;
 
   @override
@@ -58,6 +61,7 @@ class FfiInferenceMetrics {
           prefillTps == other.prefillTps &&
           decodeTps == other.decodeTps &&
           tokensOut == other.tokensOut &&
+          imagePreprocessMs == other.imagePreprocessMs &&
           stageLatenciesMs == other.stageLatenciesMs;
 }
 
@@ -66,6 +70,11 @@ class FfiInferenceMetrics {
 class FfiResult {
   final bool success;
   final String? text;
+
+  /// Model chain-of-thought / reasoning (`<think>` blocks), surfaced
+  /// separately from `text`, which always excludes it. `None` when the
+  /// model emitted no reasoning.
+  final String? reasoningContent;
   final Uint8List? audioBytes;
   final Float32List? embedding;
   final int latencyMs;
@@ -74,6 +83,7 @@ class FfiResult {
   const FfiResult({
     required this.success,
     this.text,
+    this.reasoningContent,
     this.audioBytes,
     this.embedding,
     required this.latencyMs,
@@ -84,6 +94,7 @@ class FfiResult {
   int get hashCode =>
       success.hashCode ^
       text.hashCode ^
+      reasoningContent.hashCode ^
       audioBytes.hashCode ^
       embedding.hashCode ^
       latencyMs.hashCode ^
@@ -96,6 +107,7 @@ class FfiResult {
           runtimeType == other.runtimeType &&
           success == other.success &&
           text == other.text &&
+          reasoningContent == other.reasoningContent &&
           audioBytes == other.audioBytes &&
           embedding == other.embedding &&
           latencyMs == other.latencyMs &&

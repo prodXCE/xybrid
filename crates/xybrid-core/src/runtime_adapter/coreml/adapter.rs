@@ -8,12 +8,15 @@
 //!
 //! # Example
 //!
-//! ```rust,ignore
-//! use xybrid_core::runtime_adapter::coreml::CoreMLRuntimeAdapter;
+//! ```no_run
+//! # fn _example() -> Result<(), Box<dyn std::error::Error>> {
+//! use xybrid_core::runtime_adapter::CoreMLRuntimeAdapter;
 //! use xybrid_core::runtime_adapter::RuntimeAdapter;
 //!
 //! let mut adapter = CoreMLRuntimeAdapter::new();
 //! adapter.load_model("/path/to/model.mlpackage")?;
+//! # Ok(())
+//! # }
 //! ```
 
 use crate::ir::{Envelope, EnvelopeKind};
@@ -150,6 +153,12 @@ impl CoreMLRuntimeAdapter {
                 // Embedding similarity or classification
                 Envelope::new(EnvelopeKind::Text("coreml-similarity result".to_string()))
             }
+            EnvelopeKind::Image { .. } => {
+                Envelope::new(EnvelopeKind::Text("coreml-image-output".to_string()))
+            }
+            EnvelopeKind::MultiPart(_) => Envelope::new(EnvelopeKind::Text(
+                "coreml-multimodal-unsupported".to_string(),
+            )),
         }
     }
 }

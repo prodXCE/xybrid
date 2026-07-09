@@ -1,0 +1,26 @@
+[package]
+name = "xybrid-llama"
+version.workspace = true
+edition.workspace = true
+license = "MIT"
+repository.workspace = true
+description = "Safe Rust wrappers over xybrid-llama-sys: RAII model/context handles, streaming trampoline, typed errors. Zero `unsafe` on the public surface."
+
+[lib]
+name = "xybrid_llama"
+path = "src/lib.rs"
+
+[features]
+# Default: empty crate that compiles on any target. Consumers opt in to the
+# real llama.cpp-linked implementation via `bindings`, which forwards to
+# `xybrid-llama-sys/bindings`. Off by default so workspace-wide `cargo check`
+# / `cargo clippy` on lean runners (no cmake, no C++ toolchain) stays
+# green — the heavy build cost lives in `xybrid-llama-sys/build.rs`.
+default = []
+bindings = ["xybrid-llama-sys/bindings"]
+vision = ["bindings", "xybrid-llama-sys/vision"]
+
+[dependencies]
+xybrid-llama-sys = { path = "../llama-cpp-sys", version = "0.3.0" }
+thiserror = { workspace = true }
+tracing = "0.1"

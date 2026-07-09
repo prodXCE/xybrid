@@ -15,7 +15,7 @@ Or add to your `pubspec.yaml`:
 
 ```yaml
 dependencies:
-  xybrid_flutter: ^0.1.0
+  xybrid_flutter: ^0.3.0
 ```
 
 <details>
@@ -41,6 +41,9 @@ import 'package:xybrid_flutter/xybrid_flutter.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+
+  // Runs locally with no key. Pass an apiKey to light up the dashboard:
+  //   await Xybrid.init(apiKey: const String.fromEnvironment('XYBRID_API_KEY'));
   await Xybrid.init();
 
   // Load a TTS model from the registry
@@ -51,6 +54,11 @@ Future<void> main() async {
   print('Audio: ${result.audioBytes?.length} bytes');
 }
 ```
+
+Inference runs entirely on-device whether or not you authenticate. Without an
+`apiKey`, telemetry is disabled and the first inference logs a one-shot hint
+pointing at the dashboard (suppress with `XYBRID_QUIET=1`). Get a free key at
+[dashboard.xybrid.dev](https://dashboard.xybrid.dev).
 
 ## Features
 
@@ -110,6 +118,13 @@ final audioInput = XybridEnvelope.audio(
 
 // Embedding vector
 final embeddingInput = XybridEnvelope.embedding([0.1, 0.2, 0.3]);
+
+// Vision-language prompt with an encoded image
+final image = XybridEnvelope.image(bytes: pngBytes, format: 'png');
+final visionInput = XybridEnvelope.userMessage(
+  text: 'Describe this image.',
+  images: [image],
+);
 ```
 
 ### Inference Results
@@ -130,6 +145,21 @@ if (result.success) {
   // Inference timing
   print('Latency: ${result.latencyMs}ms');
 }
+```
+
+### Reasoning (thinking models)
+
+Reasoning models (metadata `reasoning: true`, e.g. `lfm2.5-1.2b-thinking`)
+produce a chain-of-thought before their answer. Xybrid keeps it out of the
+answer text and surfaces it on `reasoningContent` — `null` for non-thinking
+models. Nothing to enable; just read it if you want it.
+
+```dart
+final result = await model.run(XybridEnvelope.text(
+    'Is 97 a prime number? Reason, then answer.'));
+
+if (result.text != null) print('Answer: ${result.text}');
+if (result.reasoningContent != null) print('Reasoning: ${result.reasoningContent}');
 ```
 
 ### LLM Streaming
@@ -179,26 +209,6 @@ Streaming with context also supported:
 await for (final token in model.runStreamingWithContext(envelope, context)) {
   stdout.write(token.token);
 }
-```
-
-### Pipeline Execution
-
-Run multi-stage ML pipelines from YAML:
-
-```dart
-final pipeline = XybridPipeline.fromYaml('''
-name: "Speech-to-Text"
-stages:
-  - "whisper-tiny@1.0"
-''');
-
-print('Pipeline: ${pipeline.name}, ${pipeline.stageCount} stages');
-
-final result = await pipeline.run(XybridEnvelope.audio(
-  bytes: audioBytes,
-  sampleRate: 16000,
-));
-print('Transcription: ${result.text}');
 ```
 
 ## Platform Support

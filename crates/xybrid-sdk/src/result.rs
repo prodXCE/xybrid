@@ -5,6 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use xybrid_core::gateway::ToolCall;
 use xybrid_core::ir::{Envelope, EnvelopeKind};
 
 /// Per-stage latency entry for pipeline runs.
@@ -21,6 +22,8 @@ pub struct StageLatency {
 ///
 /// LLM-specific fields (`ttft_ms`, `tokens_per_second`, `prefill_tps`,
 /// `decode_tps`, `tokens_out`) are `None` for ASR/TTS/embedding runs.
+/// `image_preprocess_ms` is populated only for vision-language runs that
+/// process one or more images.
 /// `stage_latencies_ms` is empty for `model.run()` and populated for
 /// `pipeline.run()`.
 ///
@@ -44,6 +47,8 @@ pub struct InferenceMetrics {
     pub decode_tps: Option<f32>,
     /// Completion tokens produced. LLM only.
     pub tokens_out: Option<u32>,
+    /// Image preprocessing latency in ms. Vision-language runs only.
+    pub image_preprocess_ms: Option<u32>,
     /// Per-stage wall-clock latencies. Empty for single-model runs.
     pub stage_latencies_ms: Vec<StageLatency>,
 }
@@ -65,6 +70,7 @@ impl InferenceMetrics {
             decode_tps: parse_f32(metadata, "decode_tps"),
             tokens_out: parse_u32(metadata, "tokens_out")
                 .or_else(|| parse_u32(metadata, "tokens_generated")),
+            image_preprocess_ms: parse_u32(metadata, "image_preprocess_ms"),
             stage_latencies_ms: Vec::new(),
         }
     }
@@ -109,8 +115,12 @@ impl std::fmt::Display for OutputType {
 ///
 /// # Example
 ///
-/// ```ignore
-/// let result = model.run(&envelope)?;
+/// ```no_run
+/// # use xybrid_sdk::{XybridModel, ir::Envelope, result::OutputType};
+/// # fn _example() -> Result<(), Box<dyn std::error::Error>> {
+/// # let model: XybridModel = unimplemented!();
+/// # let envelope: Envelope = unimplemented!();
+/// let result = model.run(&envelope, None)?;
 ///
 /// // Check output type
 /// match result.output_type() {
@@ -124,6 +134,8 @@ impl std::fmt::Display for OutputType {
 /// if let Some(text) = result.text() {
 ///     println!("Transcription: {}", text);
 /// }
+/// # Ok(())
+/// # }
 /// ```
 #[derive(Debug, Clone)]
 pub struct InferenceResult {
@@ -142,11 +154,7 @@ pub struct InferenceResult {
 impl InferenceResult {
     /// Create a new inference result from an envelope.
     pub fn new(envelope: Envelope, model_id: impl Into<String>, latency_ms: u32) -> Self {
-        let output_type = match &envelope.kind {
-            EnvelopeKind::Text(_) => OutputType::Text,
-            EnvelopeKind::Audio(_) => OutputType::Audio,
-            EnvelopeKind::Embedding(_) => OutputType::Embedding,
-        };
+        let output_type = output_type_for_envelope(&envelope);
         let metrics = InferenceMetrics::from_metadata(&envelope.metadata, latency_ms);
 
         Self {
@@ -221,6 +229,36 @@ impl InferenceResult {
             EnvelopeKind::Text(text) => Some(text),
             _ => None,
         }
+    }
+
+    /// Get the model's chain-of-thought / reasoning text, if it emitted any.
+    ///
+    /// This is the pre-strip reasoning the model produced in `<think>...</think>`
+    /// blocks (or, for engines that surface it natively, their reasoning
+    /// channel). It is *not* part of [`text`](Self::text) — the answer text
+    /// always excludes it. Returns `None` when the model produced no reasoning,
+    /// the backend doesn't surface one, or the output isn't text.
+    pub fn reasoning_content(&self) -> Option<&str> {
+        self.envelope
+            .metadata
+            .get("reasoning_content")
+            .map(String::as_str)
+    }
+
+    /// Parsed tool calls the model emitted this turn.
+    ///
+    /// Present when the request offered tools (`GenerationConfig::with_tools`)
+    /// and the model emitted at least one well-formed tool-call block
+    /// (LFM2-style `<|tool_call_start|>...` or gemma-4-style
+    /// `<|tool_call>call:...`). The raw blocks stay in [`text`](Self::text)
+    /// untouched. Returns an empty vec when the metadata is absent or
+    /// unparseable — malformed model output is never an error.
+    pub fn tool_calls(&self) -> Vec<ToolCall> {
+        self.envelope
+            .metadata
+            .get(Envelope::TOOL_CALLS_METADATA_KEY)
+            .and_then(|raw| serde_json::from_str(raw).ok())
+            .unwrap_or_default()
     }
 
     /// Get audio bytes if available.
@@ -306,6 +344,15 @@ impl InferenceResult {
     }
 }
 
+pub(crate) fn output_type_for_envelope(envelope: &Envelope) -> OutputType {
+    match &envelope.kind {
+        EnvelopeKind::Text(_) => OutputType::Text,
+        EnvelopeKind::Audio(_) => OutputType::Audio,
+        EnvelopeKind::Embedding(_) => OutputType::Embedding,
+        EnvelopeKind::Image { .. } | EnvelopeKind::MultiPart(_) => OutputType::Unknown,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -326,6 +373,94 @@ mod tests {
         assert_eq!(result.audio_bytes(), None);
         assert_eq!(result.latency_ms(), 100);
         assert_eq!(result.model_id(), "test-model");
+    }
+
+    #[test]
+    fn test_reasoning_content_from_metadata() {
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            "reasoning_content".to_string(),
+            "let me think step by step".to_string(),
+        );
+        let envelope = Envelope {
+            kind: EnvelopeKind::Text("the answer".to_string()),
+            metadata,
+        };
+        let result = InferenceResult::new(envelope, "llm-model", 100);
+
+        // Reasoning is surfaced separately from the answer text.
+        assert_eq!(result.text(), Some("the answer"));
+        assert_eq!(
+            result.reasoning_content(),
+            Some("let me think step by step")
+        );
+    }
+
+    #[test]
+    fn test_reasoning_content_absent_is_none() {
+        let envelope = Envelope {
+            kind: EnvelopeKind::Text("plain answer".to_string()),
+            metadata: HashMap::new(),
+        };
+        let result = InferenceResult::new(envelope, "llm-model", 10);
+        assert_eq!(result.reasoning_content(), None);
+    }
+
+    #[test]
+    fn test_tool_calls_parses_valid_metadata() {
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            "tool_calls".to_string(),
+            r#"[{"id":"call_0","type":"function","function":{"name":"get_temperature","arguments":"{\"room\":\"kitchen\"}"}},{"id":"call_1","type":"function","function":{"name":"get_humidity","arguments":"{\"room\":\"kitchen\"}"}}]"#
+                .to_string(),
+        );
+        let envelope = Envelope {
+            kind: EnvelopeKind::Text("tool call block".to_string()),
+            metadata,
+        };
+        let result = InferenceResult::new(envelope, "llm-model", 10);
+
+        let tool_calls = result.tool_calls();
+
+        assert_eq!(tool_calls.len(), 2);
+        let first = tool_calls
+            .first()
+            .expect("valid metadata includes first tool call");
+        assert_eq!(first.id, "call_0");
+        assert_eq!(first.tool_type, "function");
+        assert_eq!(first.function.name, "get_temperature");
+        assert_eq!(first.function.arguments, r#"{"room":"kitchen"}"#);
+        let second = tool_calls
+            .get(1)
+            .expect("valid metadata includes second tool call");
+        assert_eq!(second.id, "call_1");
+        assert_eq!(second.tool_type, "function");
+        assert_eq!(second.function.name, "get_humidity");
+        assert_eq!(second.function.arguments, r#"{"room":"kitchen"}"#);
+    }
+
+    #[test]
+    fn test_tool_calls_absent_metadata_returns_empty_vec() {
+        let envelope = Envelope {
+            kind: EnvelopeKind::Text("plain answer".to_string()),
+            metadata: HashMap::new(),
+        };
+        let result = InferenceResult::new(envelope, "llm-model", 10);
+
+        assert!(result.tool_calls().is_empty());
+    }
+
+    #[test]
+    fn test_tool_calls_invalid_json_returns_empty_vec() {
+        let mut metadata = HashMap::new();
+        metadata.insert("tool_calls".to_string(), "not-json".to_string());
+        let envelope = Envelope {
+            kind: EnvelopeKind::Text("malformed tool call block".to_string()),
+            metadata,
+        };
+        let result = InferenceResult::new(envelope, "llm-model", 10);
+
+        assert!(result.tool_calls().is_empty());
     }
 
     #[test]
@@ -376,6 +511,7 @@ mod tests {
         metadata.insert("prefill_tps".to_string(), "180.0".to_string());
         metadata.insert("decode_tps".to_string(), "42.5".to_string());
         metadata.insert("tokens_generated".to_string(), "256".to_string());
+        metadata.insert("image_preprocess_ms".to_string(), "17".to_string());
 
         let envelope = Envelope {
             kind: EnvelopeKind::Text("hi".to_string()),
@@ -390,6 +526,7 @@ mod tests {
         assert_eq!(m.prefill_tps, Some(180.0));
         assert_eq!(m.decode_tps, Some(42.5));
         assert_eq!(m.tokens_out, Some(256));
+        assert_eq!(m.image_preprocess_ms, Some(17));
         assert!(m.stage_latencies_ms.is_empty());
     }
 
@@ -405,6 +542,7 @@ mod tests {
         assert_eq!(m.ttft_ms, None);
         assert_eq!(m.tokens_per_second, None);
         assert_eq!(m.tokens_out, None);
+        assert_eq!(m.image_preprocess_ms, None);
     }
 
     #[test]

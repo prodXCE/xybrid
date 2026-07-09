@@ -145,6 +145,7 @@ impl<I: LlmInference> CodecTtsStrategy<I> {
             repetition_penalty: 1.0,
             system_prompt: None,
             stop_sequences: vec!["<|SPEECH_GENERATION_END|>".to_string()],
+            tools: Vec::new(),
         };
 
         if let ExecutionTemplate::Gguf {
@@ -548,6 +549,7 @@ mod tests {
                 apply_postprocessing: true,
             }],
             files: vec!["model.gguf".to_string()],
+            vision_encoder: None,
             description: None,
             metadata: HashMap::new(),
             voices: None,
@@ -569,6 +571,7 @@ mod tests {
             preprocessing: vec![],
             postprocessing: vec![],
             files: vec!["model.gguf".to_string()],
+            vision_encoder: None,
             description: None,
             metadata: HashMap::new(),
             voices: None,

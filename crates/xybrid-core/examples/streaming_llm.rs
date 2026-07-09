@@ -5,8 +5,11 @@
 //! Run with:
 //!   cargo run --example streaming_llm -p xybrid-core --features llm-llamacpp
 
+#[cfg(feature = "llm-llamacpp")]
 use std::collections::HashMap;
+#[cfg(feature = "llm-llamacpp")]
 use std::io::{self, Write};
+#[cfg(feature = "llm-llamacpp")]
 use std::path::PathBuf;
 
 #[cfg(feature = "llm-llamacpp")]
@@ -23,13 +26,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!(
             "Run with: cargo run --example streaming_llm -p xybrid-core --features llm-llamacpp"
         );
-        return Ok(());
     }
 
     #[cfg(feature = "llm-llamacpp")]
     {
-        run_streaming_example()
+        run_streaming_example()?;
     }
+
+    Ok(())
 }
 
 #[cfg(feature = "llm-llamacpp")]

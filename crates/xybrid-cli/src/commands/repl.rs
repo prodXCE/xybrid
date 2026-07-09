@@ -2,19 +2,32 @@
 
 #![allow(clippy::too_many_arguments)]
 
+mod agent_loop;
+mod targeting;
+mod tools;
+mod warmup;
+
 use anyhow::{Context, Result};
 use std::fs;
+use std::path::Path;
 use std::path::PathBuf;
 use xybrid_core::context::{DeviceMetrics, StageDescriptor};
 use xybrid_core::conversation::ConversationContext;
 use xybrid_core::ir::{Envelope, EnvelopeKind, MessageRole};
 use xybrid_core::orchestrator::routing_engine::LocalAvailability;
 use xybrid_core::orchestrator::Orchestrator;
+use xybrid_core::pipeline::ExecutionTarget;
 use xybrid_core::pipeline_config::PipelineConfig;
 use xybrid_sdk::model::ModelLoader;
 use xybrid_sdk::registry_client::RegistryClient;
 
 use colored::Colorize;
+
+use targeting::{
+    parse_repl_target, parse_stage_config_target, stage_config_allows_local_cache,
+    stage_is_locally_available, target_allows_local,
+};
+use warmup::warmup_models;
 
 use crate::ui;
 
@@ -25,9 +38,12 @@ pub(crate) fn handle_repl_command(
     model_file: Option<PathBuf>,
     huggingface: Option<String>,
     voice: Option<String>,
-    _target: Option<String>,
+    target: Option<String>,
     stream: bool,
+    show_reasoning: bool,
     system_prompt: Option<String>,
+    no_tools: bool,
+    tools_file: Option<PathBuf>,
     verbose: u8,
 ) -> Result<()> {
     use std::io::{self, Write};
@@ -38,6 +54,10 @@ pub(crate) fn handle_repl_command(
     ui::hint("Type 'quit' or 'exit' to exit. Type 'help' for commands.");
 
     print_streaming_status(stream);
+    let execution_target = parse_repl_target(target.as_deref())?;
+    if let Some(target) = &execution_target {
+        ui::kv("Target", target.as_str());
+    }
     println!();
 
     // --huggingface: load from HuggingFace repo
@@ -62,6 +82,7 @@ pub(crate) fn handle_repl_command(
 
         let mut stage = StageDescriptor::new(_model.model_id());
         stage.bundle_path = Some(cache_dir.to_string_lossy().to_string());
+        stage.target = execution_target.clone();
         vec![stage]
     } else if let Some(ref gguf_path) = model_file {
         // --model-file: load a bare GGUF file with auto-generated metadata
@@ -102,6 +123,7 @@ pub(crate) fn handle_repl_command(
 
         let mut stage = StageDescriptor::new(metadata.model_id.clone());
         stage.bundle_path = Some(parent_dir.to_string_lossy().to_string());
+        stage.target = execution_target.clone();
         vec![stage]
     } else {
         let client = RegistryClient::from_env().context("Failed to initialize registry client")?;
@@ -124,14 +146,18 @@ pub(crate) fn handle_repl_command(
             None
         };
 
-        load_stages(&client, &pipeline_config, &model_id)?
+        load_stages(
+            &client,
+            &pipeline_config,
+            &model_id,
+            execution_target.as_ref(),
+        )?
     };
 
     let mut conversation_context: Option<ConversationContext> = None;
-    #[cfg(any(feature = "llm-mistral", feature = "llm-llamacpp"))]
     let mut loaded_model: Option<xybrid_sdk::model::XybridModel> = None;
 
-    if stages.len() == 1 && stages[0].bundle_path.is_some() {
+    if stages.len() == 1 && stage_is_locally_available(&stages[0]) {
         let bundle_path = PathBuf::from(stages[0].bundle_path.as_ref().unwrap());
         let model_result = if bundle_path.extension().is_some_and(|ext| ext == "xyb") {
             ModelLoader::from_bundle(&bundle_path).and_then(|loader| loader.load())
@@ -155,18 +181,80 @@ pub(crate) fn handle_repl_command(
                     ui::hint("Use 'history' to view conversation, 'clear' to reset");
                 }
             }
-            #[cfg(any(feature = "llm-mistral", feature = "llm-llamacpp"))]
-            {
-                loaded_model = Some(model);
-            }
+            loaded_model = Some(model);
         }
     }
+
+    // Tool calling: on by default when the bundle's metadata declares
+    // support (`tool_calling: true`), off via --no-tools or `/tools off`.
+    // The flag is advisory and per-model — most bundles do not declare it,
+    // so this is effectively a per-model allowlist. `--tools-file` adds
+    // user-defined tools (and counts as an explicit opt-in for models
+    // whose metadata is silent).
+    let user_tools = match &tools_file {
+        Some(path) => tools::load_user_tools(path)
+            .with_context(|| format!("Failed to load tools file: {}", path.display()))?,
+        None => Vec::new(),
+    };
+    let mut tools_state = ToolsState::resolve(
+        loaded_model.as_ref(),
+        no_tools,
+        user_tools,
+        tools_file.is_some(),
+    );
+    if tools_state.active() {
+        ui::ok("Tool calling: on");
+        ui::hint("web_search / fetch_url reach the network; current_time stays local");
+        ui::kv("Search", tools_state.toolbox.provider.label());
+        if !tools_state.toolbox.user_tools.is_empty() {
+            let names: Vec<&str> = tools_state
+                .toolbox
+                .user_tools
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect();
+            ui::kv("User tools", &names.join(", "));
+        }
+        ui::hint("Disable with --no-tools or '/tools off'");
+    }
+
+    // Steering for the tool loop: the user's --system wins; otherwise a
+    // default prompt that licenses tool use with a clear stop condition.
+    let resolved_system = system_prompt.clone().or_else(|| {
+        tools_state
+            .active()
+            .then(|| agent_loop::TOOL_SYSTEM_PROMPT.to_string())
+    });
+    if system_prompt.is_none() && tools_state.active() {
+        conversation_context = conversation_context.map(|ctx| {
+            ctx.with_system(
+                Envelope::new(EnvelopeKind::Text(
+                    agent_loop::TOOL_SYSTEM_PROMPT.to_string(),
+                ))
+                .with_role(MessageRole::System),
+            )
+        });
+    }
+
+    // Streaming for the LLM chat route is resolved once up front.
+    let llm_stream = {
+        let is_llm = loaded_model.as_ref().is_some_and(|m| m.is_llm());
+        let supports = loaded_model
+            .as_ref()
+            .is_some_and(|m| m.supports_token_streaming());
+        if stream && is_llm && !supports {
+            ui::warning("Token streaming not available (LLM features not compiled) — using batch");
+        } else if stream && show_reasoning {
+            ui::hint("Token streaming disabled so reasoning can be shown before the answer");
+        }
+        stream && supports && !show_reasoning
+    };
 
     let metrics = DeviceMetrics::default();
 
     let stage_bundle_paths: std::collections::HashMap<String, bool> = stages
         .iter()
-        .map(|s| (s.name.clone(), s.bundle_path.is_some()))
+        .map(|s| (s.name.clone(), stage_is_locally_available(s)))
         .collect();
     let availability_fn = move |stage: &str| -> LocalAvailability {
         LocalAvailability::new(stage_bundle_paths.get(stage).copied().unwrap_or(false))
@@ -175,13 +263,15 @@ pub(crate) fn handle_repl_command(
     let mut orchestrator = Orchestrator::new();
     let bridge = xybrid_sdk::bridge_orchestrator_events(&orchestrator);
 
-    warmup_models(&mut orchestrator, &stages, &metrics, &availability_fn);
+    warmup_models(&stages);
 
     println!();
     ui::hint("Enter text and press Enter to run inference");
+    ui::hint("Use '/image <path>' to attach an image to the next message");
     println!("  {}", "─".repeat(50).truecolor(60, 60, 70));
 
     let stdin = io::stdin();
+    let mut pending_images = ReplPendingImages::default();
     loop {
         print!("\n  {} ", "❯".truecolor(120, 180, 255).bold());
         io::stdout().flush()?;
@@ -193,7 +283,13 @@ pub(crate) fn handle_repl_command(
 
         let input_line = input_line.trim();
 
-        let handled = handle_special_command(input_line, &mut conversation_context, verbose);
+        let handled = handle_special_command(
+            input_line,
+            &mut conversation_context,
+            &mut pending_images,
+            &mut tools_state,
+            verbose,
+        );
 
         match handled {
             SpecialCommandResult::Quit => break,
@@ -201,33 +297,85 @@ pub(crate) fn handle_repl_command(
             SpecialCommandResult::NotSpecial => {}
         }
 
-        let mut input = Envelope::new(EnvelopeKind::Text(input_line.to_string()));
-        if conversation_context.is_some() {
-            input = input.with_role(MessageRole::User);
-        }
-        if let Some(ref voice_id) = voice {
-            input
-                .metadata
-                .insert("voice_id".to_string(), voice_id.clone());
-        }
+        // LLM chat route: a single locally-loaded GGUF model runs through
+        // the agent loop — conversation context, built-in tool calling, and
+        // token streaming in one path. Image turns and pipelines take the
+        // general path below.
+        if pending_images.is_empty() {
+            if let Some(model) = loaded_model.as_ref().filter(|m| m.is_llm()) {
+                let start = std::time::Instant::now();
+                match agent_loop::run_query(
+                    model,
+                    conversation_context.as_ref(),
+                    input_line,
+                    tools_state.active().then_some(&tools_state.toolbox),
+                    resolved_system.as_deref(),
+                    llm_stream,
+                    show_reasoning,
+                    verbose,
+                ) {
+                    Ok(outcome) => {
+                        let elapsed = start.elapsed();
+                        if outcome.already_printed {
+                            println!();
+                        } else {
+                            println!();
+                            println!("  {}", outcome.answer);
+                        }
 
-        if let Some(ref mut ctx) = conversation_context {
-            ctx.push(input.clone());
-            if verbose > 1 {
-                ui::hint(&format!(
-                    "Added user message to context (total: {} messages)",
-                    ctx.history().len()
-                ));
+                        // Push user + assistant AFTER the run — pushing the
+                        // input before would double it in the prompt.
+                        if let Some(ref mut ctx) = conversation_context {
+                            ctx.push(
+                                Envelope::new(EnvelopeKind::Text(input_line.to_string()))
+                                    .with_role(MessageRole::User),
+                            );
+                            ctx.push(
+                                Envelope::new(EnvelopeKind::Text(outcome.answer.clone()))
+                                    .with_role(MessageRole::Assistant),
+                            );
+                            if verbose > 1 {
+                                ui::hint(&format!(
+                                    "Context updated (total: {} messages)",
+                                    ctx.history().len()
+                                ));
+                            }
+                        }
+
+                        println!();
+                        print_llm_chat_stats(&outcome, elapsed);
+                    }
+                    Err(e) => ui::err(&format!("{e:#}")),
+                }
+                continue;
             }
         }
+
+        let input = match build_repl_input(
+            input_line,
+            voice.as_deref(),
+            conversation_context.is_some(),
+            &mut pending_images,
+        ) {
+            Ok(input) => input,
+            Err(e) => {
+                ui::err(&format!("{}", e));
+                continue;
+            }
+        };
 
         let start = std::time::Instant::now();
 
         // Try streaming execution
         #[cfg(any(feature = "llm-mistral", feature = "llm-llamacpp"))]
         let use_streaming = {
-            let can_stream = stream && stages.len() == 1 && stages[0].bundle_path.is_some();
-            if stream && !can_stream {
+            let can_stream = stream
+                && !show_reasoning
+                && stages.len() == 1
+                && stage_is_locally_available(&stages[0]);
+            if stream && show_reasoning {
+                ui::hint("Token streaming disabled so reasoning can be shown before the answer");
+            } else if stream && !can_stream {
                 ui::warning("Streaming conditions not met");
                 if verbose > 0 {
                     ui::hint(&format!("stages.len() = {} (need 1)", stages.len()));
@@ -275,6 +423,7 @@ pub(crate) fn handle_repl_command(
             &availability_fn,
             &mut conversation_context,
             start,
+            show_reasoning,
             verbose,
         );
     }
@@ -302,6 +451,7 @@ fn load_stages(
     client: &RegistryClient,
     pipeline_config: &Option<PipelineConfig>,
     model_id: &Option<String>,
+    execution_target: Option<&ExecutionTarget>,
 ) -> Result<Vec<StageDescriptor>> {
     let mut stages = Vec::new();
 
@@ -311,8 +461,10 @@ fn load_stages(
         for stage_config in &config.stages {
             let model_id = stage_config.model_id();
             let mut desc = StageDescriptor::new(&model_id);
+            let configured_target = parse_stage_config_target(stage_config);
+            desc.target = execution_target.cloned().or(configured_target);
 
-            if !stage_config.is_cloud_stage() {
+            if stage_config_allows_local_cache(stage_config, desc.target.as_ref()) {
                 ensure_model_cached(&mut desc, &model_id, client)?;
             }
             stages.push(desc);
@@ -320,7 +472,10 @@ fn load_stages(
     } else if let Some(ref model_id) = model_id {
         ui::kv("Model", model_id);
         let mut desc = StageDescriptor::new(model_id);
-        ensure_model_cached(&mut desc, model_id, client)?;
+        desc.target = execution_target.cloned();
+        if target_allows_local(desc.target.as_ref()) {
+            ensure_model_cached(&mut desc, model_id, client)?;
+        }
         stages.push(desc);
     }
 
@@ -356,40 +511,163 @@ fn ensure_model_cached(
     Ok(())
 }
 
-fn warmup_models(
-    orchestrator: &mut Orchestrator,
-    stages: &[StageDescriptor],
-    metrics: &xybrid_core::context::DeviceMetrics,
-    availability_fn: &dyn Fn(&str) -> LocalAvailability,
-) {
-    let sp = ui::spinner("Warming up models...");
-    let warmup_input = Envelope {
-        kind: EnvelopeKind::Text("Hi".to_string()),
-        metadata: std::collections::HashMap::new(),
-    };
-    match orchestrator.execute_pipeline(stages, &warmup_input, metrics, availability_fn) {
-        Ok(_) => {
-            sp.finish_and_clear();
-            ui::ok("Models loaded and warm. Ready for input!");
-        }
-        Err(e) => {
-            sp.finish_and_clear();
-            ui::warning(&format!("Warmup failed ({}), first query may be slow", e));
-        }
-    }
-}
-
 enum SpecialCommandResult {
     Quit,
     Continue,
     NotSpecial,
 }
 
+/// Session state for tool calling (built-ins + `--tools-file` user tools).
+struct ToolsState {
+    /// Tools may be offered to this model at all.
+    available: bool,
+    /// Session toggle (`--no-tools`, `/tools on|off`).
+    enabled: bool,
+    toolbox: tools::ToolBox,
+}
+
+impl ToolsState {
+    fn resolve(
+        model: Option<&xybrid_sdk::model::XybridModel>,
+        no_tools: bool,
+        user_tools: Vec<tools::UserTool>,
+        explicit_tools_file: bool,
+    ) -> Self {
+        let is_llm = model.is_some_and(|m| m.is_llm());
+        let declared = model.and_then(|m| m.supports_tool_calling());
+        // The advisory metadata flag gates the default. An explicit
+        // --tools-file is a user opt-in that overrides *silence* (a model
+        // whose template cannot render tools still fails loudly at run
+        // time) — but not an explicit `tool_calling: false`.
+        let available = is_llm
+            && match declared {
+                Some(true) => true,
+                Some(false) => false,
+                None => explicit_tools_file,
+            };
+        if explicit_tools_file {
+            if !is_llm {
+                ui::warning("--tools-file ignored: no locally-loaded LLM in this session");
+            } else if declared == Some(false) {
+                ui::warning("The model's metadata declares tool_calling: false — tools stay off");
+            } else if no_tools {
+                ui::warning("--no-tools wins over --tools-file: tools are off");
+            }
+        }
+        let (provider, warning) = tools::SearchProvider::from_env();
+        if available && !no_tools {
+            if let Some(warning) = warning {
+                ui::warning(&warning);
+            }
+        }
+        Self {
+            available,
+            enabled: available && !no_tools,
+            toolbox: tools::ToolBox {
+                provider,
+                user_tools,
+            },
+        }
+    }
+
+    fn active(&self) -> bool {
+        self.available && self.enabled
+    }
+}
+
+/// Post-query stats line for the LLM chat route: token throughput when the
+/// answer streamed, otherwise wall-clock (with the tool-call count when the
+/// turn used tools).
+fn print_llm_chat_stats(outcome: &agent_loop::QueryOutcome, elapsed: std::time::Duration) {
+    if let Some(stats) = &outcome.stream_stats {
+        let ttft_ms = stats.ttft.map(|d| d.as_millis()).unwrap_or(0);
+        let decode_tok_s = stats.ttft.and_then(|ttft| {
+            let decode_time = elapsed.saturating_sub(ttft).as_secs_f64();
+            (stats.tokens >= 2 && decode_time > 0.001)
+                .then(|| (stats.tokens - 1) as f64 / decode_time)
+        });
+        match decode_tok_s {
+            Some(tok_s) => ui::hint(&format!(
+                "{} tokens in {:.2}s ({:.1} tok/s, {}ms to first token)",
+                stats.tokens,
+                elapsed.as_secs_f64(),
+                tok_s,
+                ttft_ms
+            )),
+            None => ui::hint(&format!(
+                "{} tokens in {:.2}s",
+                stats.tokens,
+                elapsed.as_secs_f64()
+            )),
+        }
+    } else if outcome.tool_calls_run > 0 {
+        ui::hint(&format!(
+            "Inference time: {:.2}s ({} tool call{})",
+            elapsed.as_secs_f32(),
+            outcome.tool_calls_run,
+            if outcome.tool_calls_run == 1 { "" } else { "s" }
+        ));
+    } else {
+        ui::hint(&format!("Inference time: {:.2}s", elapsed.as_secs_f32()));
+    }
+}
+
+fn print_reasoning(show_reasoning: bool, reasoning: Option<&str>) {
+    if !show_reasoning {
+        return;
+    }
+
+    match reasoning {
+        Some(reasoning) if !reasoning.is_empty() => {
+            println!();
+            ui::section("Reasoning");
+            println!();
+            println!("    {}", reasoning);
+        }
+        _ => {
+            println!();
+            ui::hint("No reasoning emitted (model produced no <think> blocks)");
+        }
+    }
+}
+
+#[derive(Default)]
+struct ReplPendingImages {
+    paths: Vec<PathBuf>,
+}
+
+impl ReplPendingImages {
+    fn is_empty(&self) -> bool {
+        self.paths.is_empty()
+    }
+
+    fn len(&self) -> usize {
+        self.paths.len()
+    }
+
+    fn push(&mut self, path: PathBuf) {
+        self.paths.push(path);
+    }
+
+    fn clear(&mut self) {
+        self.paths.clear();
+    }
+}
+
 fn handle_special_command(
     input: &str,
     conversation_context: &mut Option<ConversationContext>,
+    pending_images: &mut ReplPendingImages,
+    tools_state: &mut ToolsState,
     verbose: u8,
 ) -> SpecialCommandResult {
+    if let Some(result) = handle_image_command(input, pending_images) {
+        return result;
+    }
+    if let Some(result) = handle_tools_command(input, tools_state) {
+        return result;
+    }
+
     match input.to_lowercase().as_str() {
         "quit" | "exit" | "q" => {
             println!();
@@ -401,6 +679,14 @@ fn handle_special_command(
             ui::hint("Commands:");
             println!("    {}  Exit REPL", ui::dim("quit, exit, q"));
             println!("    {}       Show this help", ui::dim("help, ?"));
+            println!(
+                "    {}   Attach image to next message",
+                ui::dim("/image <path>")
+            );
+            println!(
+                "    {} List / toggle built-in tools",
+                ui::dim("/tools [on|off]")
+            );
             if conversation_context.is_some() {
                 println!("    {}      Show conversation history", ui::dim("history"));
                 println!("    {}        Clear conversation history", ui::dim("clear"));
@@ -452,6 +738,162 @@ fn handle_special_command(
         "" => SpecialCommandResult::Continue,
         _ => SpecialCommandResult::NotSpecial,
     }
+}
+
+/// `/tools` — list the built-in tools; `/tools on|off` toggles them for the
+/// session (on requires the model to declare support).
+fn handle_tools_command(input: &str, tools_state: &mut ToolsState) -> Option<SpecialCommandResult> {
+    let trimmed = input.trim();
+    let mut parts = trimmed.splitn(2, char::is_whitespace);
+    if !parts
+        .next()
+        .unwrap_or_default()
+        .eq_ignore_ascii_case("/tools")
+    {
+        return None;
+    }
+
+    match parts.next().map(str::trim).unwrap_or("") {
+        "" => {
+            println!();
+            if tools_state.active() {
+                ui::hint("Tool calling: on");
+            } else if tools_state.available {
+                ui::hint("Tool calling: off — enable with '/tools on'");
+            } else {
+                ui::hint(
+                    "Tool calling: unavailable — the model's metadata does not \
+                     declare `tool_calling: true`",
+                );
+            }
+            println!(
+                "    {}    Search the web via {}",
+                ui::dim("web_search"),
+                tools_state.toolbox.provider.label()
+            );
+            println!(
+                "    {}     Fetch a public http(s) URL",
+                ui::dim("fetch_url")
+            );
+            println!("    {}  Local date and time", ui::dim("current_time"));
+            for tool in &tools_state.toolbox.user_tools {
+                println!("    {}  {} (user)", ui::dim(&tool.name), tool.description);
+            }
+            ui::hint("Search provider: set XYBRID_SEARCH_PROVIDER=wikipedia|tavily|brave");
+            ui::hint("Add your own tools with --tools-file <file>");
+        }
+        "on" => {
+            if tools_state.available {
+                tools_state.enabled = true;
+                ui::ok("Tool calling enabled");
+            } else {
+                ui::err(
+                    "This model does not declare tool support \
+                     (metadata `tool_calling: true`)",
+                );
+            }
+        }
+        "off" => {
+            tools_state.enabled = false;
+            ui::ok("Tool calling disabled for this session");
+        }
+        other => {
+            ui::err(&format!("Unknown option '{other}'. Usage: /tools [on|off]"));
+        }
+    }
+    Some(SpecialCommandResult::Continue)
+}
+
+fn handle_image_command(
+    input: &str,
+    pending_images: &mut ReplPendingImages,
+) -> Option<SpecialCommandResult> {
+    let trimmed = input.trim();
+    let mut parts = trimmed.splitn(2, char::is_whitespace);
+    let command = parts.next().unwrap_or_default();
+    if !command.eq_ignore_ascii_case("/image") {
+        return None;
+    }
+
+    let Some(path) = parts.next().map(str::trim).filter(|path| !path.is_empty()) else {
+        ui::err("Usage: /image <path>");
+        return Some(SpecialCommandResult::Continue);
+    };
+
+    {
+        let path = PathBuf::from(path);
+        if !path.exists() {
+            ui::err(&format!("Image not found: {}", path.display()));
+            return Some(SpecialCommandResult::Continue);
+        }
+
+        pending_images.push(path);
+        ui::ok(&format!(
+            "Image attached to next message ({} pending)",
+            pending_images.len()
+        ));
+    }
+
+    Some(SpecialCommandResult::Continue)
+}
+
+fn build_repl_input(
+    input_line: &str,
+    voice: Option<&str>,
+    conversation_context_enabled: bool,
+    pending_images: &mut ReplPendingImages,
+) -> Result<Envelope> {
+    if !pending_images.is_empty() {
+        if voice.is_some() {
+            return Err(anyhow::anyhow!(
+                "--voice cannot be combined with /image attachments"
+            ));
+        }
+        return build_repl_multimodal_input(input_line, pending_images);
+    }
+
+    let mut input = Envelope::new(EnvelopeKind::Text(input_line.to_string()));
+    if conversation_context_enabled {
+        input = input.with_role(MessageRole::User);
+    }
+    if let Some(voice_id) = voice {
+        input
+            .metadata
+            .insert("voice_id".to_string(), voice_id.to_string());
+    }
+
+    Ok(input)
+}
+
+fn build_repl_multimodal_input(
+    input_line: &str,
+    pending_images: &mut ReplPendingImages,
+) -> Result<Envelope> {
+    let images = read_repl_images(&pending_images.paths)?;
+    let input = Envelope::user_message(input_line, images)
+        .context("Failed to build multimodal REPL input")?;
+    pending_images.clear();
+    Ok(input)
+}
+
+fn read_repl_images(image_paths: &[PathBuf]) -> Result<Vec<Envelope>> {
+    let mut images = Vec::with_capacity(image_paths.len());
+    for image_path in image_paths {
+        let image_bytes = fs::read(image_path)
+            .with_context(|| format!("Failed to read image file: {}", image_path.display()))?;
+        let format = image_format_hint(image_path)?;
+        images.push(
+            Envelope::image(image_bytes, format)
+                .with_context(|| format!("Invalid image input: {}", image_path.display()))?,
+        );
+    }
+    Ok(images)
+}
+
+fn image_format_hint(path: &Path) -> Result<&str> {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .ok_or_else(|| anyhow::anyhow!("Image file has no extension: {}", path.display()))
 }
 
 #[cfg(any(feature = "llm-mistral", feature = "llm-llamacpp"))]
@@ -560,6 +1002,10 @@ fn execute_streaming(
             println!();
 
             if let Some(ref mut ctx) = conversation_context {
+                // Push the user turn only after the run: the streaming
+                // context path appends the input itself, so pushing before
+                // dispatch doubles it in the prompt.
+                ctx.push(input.clone());
                 if let Ok(text) = accumulated_text.lock() {
                     let assistant_response = Envelope::new(EnvelopeKind::Text(text.clone()))
                         .with_role(MessageRole::Assistant);
@@ -623,6 +1069,7 @@ fn execute_batch(
     availability_fn: &dyn Fn(&str) -> LocalAvailability,
     conversation_context: &mut Option<ConversationContext>,
     start: std::time::Instant,
+    show_reasoning: bool,
     verbose: u8,
 ) {
     match orchestrator.execute_pipeline(stages, input, metrics, availability_fn) {
@@ -630,9 +1077,24 @@ fn execute_batch(
             let elapsed = start.elapsed();
             println!();
 
+            // Record the user turn only now that the run succeeded (and
+            // never before dispatch — context-aware paths add the input
+            // themselves, so an early push doubles it in the prompt).
+            if let Some(ref mut ctx) = conversation_context {
+                ctx.push(input.clone());
+            }
+
             for result in &results {
                 match &result.output.kind {
                     EnvelopeKind::Text(text) => {
+                        print_reasoning(
+                            show_reasoning,
+                            result
+                                .output
+                                .metadata
+                                .get("reasoning_content")
+                                .map(String::as_str),
+                        );
                         println!("  {}", text);
 
                         if let Some(ref mut ctx) = conversation_context {
@@ -655,6 +1117,15 @@ fn execute_batch(
                     EnvelopeKind::Embedding(vec) => {
                         ui::ok(&format!("Embedding: {} dimensions", vec.len()));
                     }
+                    EnvelopeKind::Image { .. } => {
+                        ui::ok(&format!(
+                            "Image output: {} bytes",
+                            result.output.payload_size()
+                        ));
+                    }
+                    EnvelopeKind::MultiPart(parts) => {
+                        ui::ok(&format!("Multi-part output: {} parts", parts.len()));
+                    }
                 }
             }
 
@@ -664,5 +1135,164 @@ fn execute_batch(
         Err(e) => {
             ui::err(&format!("{}", e));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_tools_state(available: bool) -> ToolsState {
+        ToolsState {
+            available,
+            enabled: available,
+            toolbox: tools::ToolBox {
+                provider: tools::SearchProvider::Wikipedia,
+                user_tools: Vec::new(),
+            },
+        }
+    }
+
+    #[test]
+    fn image_command_is_handled() {
+        let mut conversation_context = None;
+        let mut pending_images = ReplPendingImages::default();
+        let mut tools_state = test_tools_state(false);
+
+        let dir = tempfile::tempdir().unwrap();
+        let image_path = dir.path().join("fixture.png");
+        fs::write(&image_path, png_image(2, 3)).unwrap();
+
+        let result = handle_special_command(
+            &format!("/image {}", image_path.display()),
+            &mut conversation_context,
+            &mut pending_images,
+            &mut tools_state,
+            0,
+        );
+
+        assert!(matches!(result, SpecialCommandResult::Continue));
+        assert_eq!(pending_images.len(), 1);
+        assert_eq!(pending_images.paths[0], image_path);
+    }
+
+    #[test]
+    fn tools_command_toggles_session_state() {
+        // Toggle works when the model declares support…
+        let mut tools_state = test_tools_state(true);
+        assert!(tools_state.active());
+
+        assert!(matches!(
+            handle_tools_command("/tools off", &mut tools_state),
+            Some(SpecialCommandResult::Continue)
+        ));
+        assert!(!tools_state.active());
+
+        handle_tools_command("/tools on", &mut tools_state);
+        assert!(tools_state.active());
+
+        // …and `on` is refused when it does not.
+        let mut unavailable = test_tools_state(false);
+        handle_tools_command("/tools on", &mut unavailable);
+        assert!(!unavailable.active());
+
+        // Non-/tools input passes through untouched.
+        assert!(handle_tools_command("hello", &mut tools_state).is_none());
+    }
+
+    #[test]
+    fn repl_multimodal_input_consumes_pending_image() {
+        let dir = tempfile::tempdir().unwrap();
+        let image_path = dir.path().join("fixture.png");
+        fs::write(&image_path, png_image(2, 3)).unwrap();
+        let mut pending_images = ReplPendingImages::default();
+        pending_images.push(image_path);
+
+        let input = build_repl_input("describe this", None, true, &mut pending_images).unwrap();
+        let parts = input.as_multipart().expect("REPL input is multipart");
+
+        assert!(pending_images.is_empty());
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0].as_text(), Some("describe this"));
+        assert!(parts[1].is_image());
+        assert_eq!(
+            parts[1].image_dimensions(),
+            Some(xybrid_core::ir::ImageDimensions {
+                width: 2,
+                height: 3,
+            })
+        );
+        assert_eq!(input.role(), Some(MessageRole::User));
+    }
+
+    #[test]
+    fn repl_multimodal_input_rejects_corrupt_image_with_redacted_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let image_path = dir.path().join("corrupt.jpeg");
+        fs::write(&image_path, [42_u8, 42, 42, 42]).unwrap();
+        let mut pending_images = ReplPendingImages::default();
+        pending_images.push(image_path);
+
+        let err = build_repl_input("describe this", None, true, &mut pending_images).unwrap_err();
+        let message = format!("{err:#}");
+
+        assert!(message.contains("Invalid image input"));
+        assert!(message.contains("invalid or corrupt jpeg image bytes"));
+        assert!(!message.contains("[42"));
+        assert!(!message.contains("42, 42"));
+    }
+
+    #[test]
+    fn direct_model_network_target_skips_registry_cache_lookup() {
+        for target in [ExecutionTarget::Cloud, ExecutionTarget::Server] {
+            let client = RegistryClient::with_url("http://127.0.0.1:9").unwrap();
+
+            let stages = load_stages(
+                &client,
+                &None,
+                &Some("test-model".to_string()),
+                Some(&target),
+            )
+            .unwrap();
+
+            assert_eq!(stages.len(), 1);
+            assert_eq!(stages[0].target.as_ref(), Some(&target));
+            assert!(stages[0].bundle_path.is_none());
+        }
+    }
+
+    #[test]
+    fn invalid_yaml_target_is_ignored_without_hard_failure() {
+        let config = PipelineConfig::from_yaml(
+            r#"
+name: test
+stages:
+  - id: llm
+    model: test-model
+    target: clod
+    provider: openai
+"#,
+        )
+        .unwrap();
+        let client = RegistryClient::with_url("http://127.0.0.1:9").unwrap();
+
+        let stages = load_stages(&client, &Some(config), &None, None).unwrap();
+
+        assert_eq!(stages.len(), 1);
+        assert_eq!(stages[0].target, None);
+        assert!(stages[0].bundle_path.is_none());
+    }
+
+    fn png_image(width: u32, height: u32) -> Vec<u8> {
+        let image = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+            width,
+            height,
+            image::Rgb([17, 34, 51]),
+        ));
+        let mut encoded = std::io::Cursor::new(Vec::new());
+        image
+            .write_to(&mut encoded, image::ImageFormat::Png)
+            .expect("test image encodes");
+        encoded.into_inner()
     }
 }

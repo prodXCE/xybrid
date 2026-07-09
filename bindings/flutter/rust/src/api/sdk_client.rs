@@ -1,6 +1,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use flutter_rust_bridge::frb;
+use xybrid_ffi_facade as facade;
 use xybrid_sdk::ResourceTelemetryMode;
 
 use super::FLUTTER_BINDING;
@@ -32,6 +33,18 @@ fn initialize_telemetry_once(config: xybrid_sdk::TelemetryConfig) {
     xybrid_sdk::telemetry::init_platform_telemetry(config);
 }
 
+/// Resolve the telemetry ingest endpoint for the bundled init path: use the
+/// caller-supplied URL when present and non-blank, otherwise fall back to
+/// [`xybrid_sdk::telemetry::DEFAULT_INGEST_URL`]. Keeping this a pure free
+/// function lets the defaulting rule be unit-tested without touching the
+/// process-wide telemetry once-guard.
+fn resolve_ingest_endpoint(ingest_url: Option<&str>) -> &str {
+    ingest_url
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(xybrid_sdk::telemetry::DEFAULT_INGEST_URL)
+}
+
 fn parse_resource_telemetry_mode(value: Option<&str>) -> Option<ResourceTelemetryMode> {
     let raw = value?.trim().to_ascii_lowercase();
     if raw.is_empty() {
@@ -60,19 +73,23 @@ fn parse_resource_telemetry_mode(value: Option<&str>) -> Option<ResourceTelemetr
 impl XybridSdkClient {
     #[frb(sync)]
     pub fn init_sdk_cache_dir(cache_dir: String) {
-        xybrid_sdk::set_binding(FLUTTER_BINDING);
-        xybrid_sdk::init_sdk_cache_dir(cache_dir);
+        facade::set_binding(FLUTTER_BINDING.to_string());
+        facade::init_sdk_cache_dir(cache_dir);
     }
 
     #[frb(sync)]
     pub fn set_api_key(api_key: &str) {
-        xybrid_sdk::set_binding(FLUTTER_BINDING);
-        xybrid_sdk::set_api_key(api_key);
+        facade::set_binding(FLUTTER_BINDING.to_string());
+        facade::set_api_key(api_key.to_string());
     }
 
     #[frb(sync)]
     pub fn set_gateway_url(gateway_url: String) {
-        xybrid_sdk::set_binding(FLUTTER_BINDING);
+        facade::set_binding(FLUTTER_BINDING.to_string());
+        // `set_gateway_url` is gateway-routing-specific and not part of the
+        // facade's init surface (would bloat it for one platform). Route
+        // straight to the SDK; the binding identifier is already registered
+        // above so registry calls are still attributed correctly.
         xybrid_sdk::set_gateway_url(gateway_url);
     }
 
@@ -96,28 +113,33 @@ impl XybridSdkClient {
     /// spins up its own background thread for batched sends.
     #[frb(sync)]
     pub fn init_telemetry(endpoint: String, api_key: String) {
-        xybrid_sdk::set_binding(FLUTTER_BINDING);
+        facade::set_binding(FLUTTER_BINDING.to_string());
         let config = xybrid_sdk::TelemetryConfig::new(endpoint, api_key);
         initialize_telemetry_once(config);
     }
 
+    /// Start the platform telemetry exporter from the bundled
+    /// `Xybrid.init(apiKey: ...)` path.
+    ///
+    /// When `ingest_url` is absent or blank the exporter targets
+    /// [`xybrid_sdk::telemetry::DEFAULT_INGEST_URL`], so providing only an
+    /// API key is enough to light up the dashboard — the caller does not
+    /// need to know the ingest endpoint. Shares the process-wide once-guard
+    /// with [`Self::init_telemetry`]; whichever path runs first wins.
     #[frb(sync)]
     pub fn configure_platform_telemetry(
         api_key: String,
         ingest_url: Option<String>,
         resource_telemetry: Option<String>,
     ) {
-        xybrid_sdk::set_binding(FLUTTER_BINDING);
-        xybrid_sdk::set_api_key(&api_key);
+        // Route binding + api-key through the facade (bolt migration);
+        // master's DEFAULT_INGEST_URL defaulting lives in
+        // resolve_ingest_endpoint below. Clone the key because it's moved
+        // into TelemetryConfig::new on the next line.
+        facade::set_binding(FLUTTER_BINDING.to_string());
+        facade::set_api_key(api_key.clone());
 
-        let Some(endpoint) = ingest_url
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        else {
-            return;
-        };
-
+        let endpoint = resolve_ingest_endpoint(ingest_url.as_deref());
         let mut config = xybrid_sdk::TelemetryConfig::new(endpoint, api_key);
         if let Some(mode) = parse_resource_telemetry_mode(resource_telemetry.as_deref()) {
             config = config.with_resource_telemetry(mode);
@@ -133,6 +155,19 @@ impl XybridSdkClient {
         TELEMETRY_INITIALIZED.load(Ordering::Acquire)
     }
 
+    /// Return the xybrid runtime features compiled into this native library.
+    ///
+    /// Studio uses this to decide whether image upload should be enabled for
+    /// VisionLanguage models. Keeping the answer in Rust avoids stale Dart-side
+    /// assumptions about Cargo features.
+    #[frb(sync)]
+    pub fn runtime_features() -> Vec<String> {
+        xybrid_sdk::features::enabled()
+            .iter()
+            .map(|feature| (*feature).to_string())
+            .collect()
+    }
+
     #[frb(sync)]
     pub fn flush_platform_telemetry() {
         xybrid_sdk::telemetry::flush_platform_telemetry();
@@ -145,7 +180,7 @@ impl XybridSdkClient {
     /// at `~/.xybrid/cache/extracted/{model_id}/model_metadata.json`.
     #[frb(sync)]
     pub fn is_model_cached(model_id: &str) -> bool {
-        xybrid_sdk::set_binding(FLUTTER_BINDING);
+        facade::set_binding(FLUTTER_BINDING.to_string());
         if let Ok(client) = xybrid_sdk::RegistryClient::from_env() {
             return client.is_extracted(model_id);
         }
@@ -178,5 +213,53 @@ mod tests {
         let client = xybrid_sdk::RegistryClient::default_client()
             .expect("default_client should succeed in tests");
         assert_eq!(client.binding(), FLUTTER_BINDING);
+    }
+
+    #[test]
+    fn ingest_endpoint_defaults_when_absent() {
+        assert_eq!(
+            resolve_ingest_endpoint(None),
+            xybrid_sdk::telemetry::DEFAULT_INGEST_URL
+        );
+    }
+
+    #[test]
+    fn ingest_endpoint_defaults_when_blank() {
+        assert_eq!(
+            resolve_ingest_endpoint(Some("   ")),
+            xybrid_sdk::telemetry::DEFAULT_INGEST_URL
+        );
+    }
+
+    #[test]
+    fn ingest_endpoint_uses_supplied_value() {
+        assert_eq!(
+            resolve_ingest_endpoint(Some("http://192.168.1.78:8081")),
+            "http://192.168.1.78:8081"
+        );
+    }
+
+    #[test]
+    fn ingest_endpoint_trims_surrounding_whitespace() {
+        assert_eq!(
+            resolve_ingest_endpoint(Some("  https://ingest.example  ")),
+            "https://ingest.example"
+        );
+    }
+
+    #[test]
+    fn runtime_features_mirror_core_feature_introspection() {
+        let expected: Vec<String> = xybrid_sdk::features::enabled()
+            .iter()
+            .map(|feature| (*feature).to_string())
+            .collect();
+
+        assert_eq!(XybridSdkClient::runtime_features(), expected);
+    }
+
+    #[cfg(feature = "llm-llamacpp-vision")]
+    #[test]
+    fn runtime_features_report_llama_cpp_vision_when_compiled() {
+        assert!(XybridSdkClient::runtime_features().contains(&"llm-llamacpp-vision".to_string()));
     }
 }
